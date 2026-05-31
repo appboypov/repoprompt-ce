@@ -1,0 +1,106 @@
+.PHONY: doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest dev-status dev-build dev-swift-build dev-run dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-stop-app dev-daemon-stop clean
+
+PRODUCT ?= all
+
+doctor:
+	./Scripts/doctor.sh
+
+setup:
+	./Scripts/install_format_tools.sh install
+	./Scripts/doctor.sh
+	swift package resolve
+
+install-format-tools:
+	./Scripts/install_format_tools.sh install
+
+format-tools-status:
+	./Scripts/install_format_tools.sh status
+
+format:
+	./Scripts/swift_style.sh format
+
+format-check:
+	./Scripts/swift_style.sh format-check
+
+lint:
+	./Scripts/swift_style.sh lint
+
+install-debug-cli:
+	./Scripts/install_debug_cli.sh install --build
+
+uninstall-debug-cli:
+	./Scripts/install_debug_cli.sh uninstall
+
+debug-cli-status:
+	./Scripts/install_debug_cli.sh status
+
+resolve:
+	swift package resolve
+
+build:
+	./Scripts/package_app.sh debug
+
+run:
+	./Scripts/run.sh
+
+test:
+	swift test
+
+guardrails:
+	./Scripts/source_layout_guardrails.sh
+	./Scripts/contributor_allowlist_guardrails.sh
+
+conductor-selftest:
+	python3 Scripts/test_conductor_output.py
+	python3 Scripts/test_conductor_lifecycle.py
+
+dev-status:
+	./conductor status
+
+dev-build:
+	./conductor build
+
+dev-swift-build:
+	./conductor swift-build --product $(PRODUCT)
+
+dev-run:
+	./conductor run
+
+dev-test:
+	./conductor test$(if $(FILTER), --filter $(FILTER))
+
+dev-provider-test:
+	./conductor provider-test$(if $(FILTER), --filter $(FILTER))
+
+dev-smoke:
+	./conductor smoke
+
+dev-smoke-launch:
+	./conductor smoke --launch
+
+dev-format:
+	./conductor format
+
+dev-format-check:
+	./conductor format-check
+
+dev-lint:
+	./conductor lint
+
+dev-format-tools-status:
+	./conductor format-tools-status
+
+dev-check-format-tools:
+	./conductor check-format-tools
+
+dev-install-format-tools:
+	./conductor install-format-tools
+
+dev-stop-app:
+	./conductor app stop
+
+dev-daemon-stop:
+	./conductor daemon stop
+
+clean:
+	rm -rf .build

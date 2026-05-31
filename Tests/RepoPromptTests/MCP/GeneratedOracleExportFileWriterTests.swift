@@ -1,0 +1,160 @@
+import MCP
+@testable import RepoPrompt
+import XCTest
+
+final class GeneratedOracleExportFileWriterTests: XCTestCase {
+    private var temporaryRoots: [URL] = []
+
+    func testOracleExportInstructionQuotesExactAbsolutePathLiteral() throws {
+        let path = "/tmp/repo root/prompt-exports/oracle `plan`.md"
+        let literal = try XCTUnwrap(String(data: JSONEncoder().encode(path), encoding: .utf8))
+        let instruction = AgentOracleExport.instruction(path: path)
+
+        XCTAssertTrue(instruction.contains("`read_file`"), instruction)
+        XCTAssertTrue(instruction.contains("{\"path\": \(literal)}"), instruction)
+        XCTAssertTrue(instruction.contains("exact absolute `path` value verbatim"), instruction)
+    }
+
+    override func tearDownWithError() throws {
+        for url in temporaryRoots {
+            try? FileManager.default.removeItem(at: url)
+        }
+        temporaryRoots.removeAll()
+        try super.tearDownWithError()
+    }
+
+    func testGeneratedExportWriterReturnsPathImmediatelyReadableByReadFileSemantics() async throws {
+        let root = try makeTemporaryRoot(name: "OracleExportReadable")
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        let destination = OracleExportDestination(
+            workspaceID: UUID(),
+            windowID: 1,
+            tabID: nil,
+            primaryRootPath: root.path
+        )
+        let exportPath = root.appendingPathComponent("prompt-exports/oracle-plan-readable.md").path
+
+        let resolvedPath = try await GeneratedOracleExportFileWriter(store: store).write(
+            path: exportPath,
+            content: "# Oracle Plan\n\nRead me",
+            destination: destination
+        )
+
+        XCTAssertEqual(resolvedPath, StandardizedPath.absolute(exportPath))
+        let readableService = WorkspaceReadableFileService(store: store)
+        switch await readableService.resolveReadableFile(resolvedPath, profile: .mcpRead, rootScope: .visibleWorkspace) {
+        case let .some(.workspace(file)):
+            XCTAssertEqual(file.standardizedFullPath, resolvedPath)
+            let content = try await store.readContent(rootID: rootRecord.id, relativePath: file.standardizedRelativePath)
+            XCTAssertEqual(content, "# Oracle Plan\n\nRead me")
+        case let .some(.external(file)):
+            XCTFail("Generated export should resolve as workspace file, got external file: \(file.displayPath)")
+        case nil:
+            XCTFail("Generated export was not readable through WorkspaceReadableFileService")
+        }
+    }
+
+    func testGeneratedExportWriterRejectsUnloadedPrimaryRootWithoutDirectFileManagerFallback() async throws {
+        let root = try makeTemporaryRoot(name: "OracleExportUnloaded")
+        let store = WorkspaceFileContextStore()
+        let destination = OracleExportDestination(
+            workspaceID: UUID(),
+            windowID: 1,
+            tabID: nil,
+            primaryRootPath: root.path
+        )
+        let exportPath = root.appendingPathComponent("prompt-exports/oracle-plan-unloaded.md").path
+
+        do {
+            _ = try await GeneratedOracleExportFileWriter(store: store).write(
+                path: exportPath,
+                content: "unreadable",
+                destination: destination
+            )
+            XCTFail("Expected unloaded generated export root to fail")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("not loaded in the current read_file workspace scope"), message)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), "Generated exports must not direct-write outside loaded read_file roots")
+    }
+
+    func testGeneratedExportWriterRejectsIgnoredExportPathAsUnreadable() async throws {
+        let root = try makeTemporaryRoot(name: "OracleExportIgnored")
+        try write("prompt-exports/\n", to: root.appendingPathComponent(".gitignore"))
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let destination = OracleExportDestination(
+            workspaceID: UUID(),
+            windowID: 1,
+            tabID: nil,
+            primaryRootPath: root.path
+        )
+        let exportPath = root.appendingPathComponent("prompt-exports/oracle-plan-ignored.md").path
+
+        do {
+            _ = try await GeneratedOracleExportFileWriter(store: store).write(
+                path: exportPath,
+                content: "ignored",
+                destination: destination
+            )
+            XCTFail("Expected ignored generated export path to fail")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("not readable by read_file"), message)
+            XCTAssertTrue(message.contains("ignored") || message.contains("workspace policy"), message)
+        }
+
+        let readableService = WorkspaceReadableFileService(store: store)
+        let ignoredReadableFile = await readableService.resolveReadableFile(exportPath, profile: .mcpRead, rootScope: .visibleWorkspace)
+        XCTAssertNil(ignoredReadableFile, "Ignored generated export should remain unreadable through read_file semantics")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), "Rejected generated exports should clean up unreadable disk artifacts")
+    }
+
+    func testGeneratedExportWriterCleansUpSymlinkedExportPathFailure() async throws {
+        let root = try makeTemporaryRoot(name: "OracleExportSymlink")
+        let outside = try makeTemporaryRoot(name: "OracleExportSymlinkOutside")
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("prompt-exports"),
+            withDestinationURL: outside
+        )
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let destination = OracleExportDestination(
+            workspaceID: UUID(),
+            windowID: 1,
+            tabID: nil,
+            primaryRootPath: root.path
+        )
+        let exportPath = root.appendingPathComponent("prompt-exports/oracle-plan-symlink.md").path
+        let outsideTarget = outside.appendingPathComponent("oracle-plan-symlink.md").path
+
+        do {
+            _ = try await GeneratedOracleExportFileWriter(store: store).write(
+                path: exportPath,
+                content: "symlinked",
+                destination: destination
+            )
+            XCTFail("Expected symlinked generated export path to fail")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("not readable by read_file") || message.contains("symlink"), message)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outsideTarget), "Rejected generated exports should clean up symlinked disk artifacts")
+    }
+
+    private func makeTemporaryRoot(name: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptCE-\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        temporaryRoots.append(url)
+        return url
+    }
+
+    private func write(_ content: String, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}

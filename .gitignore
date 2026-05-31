@@ -1,0 +1,52 @@
+# Swift Package Manager / build artifacts
+.build/
+.swiftpm/
+Package.resolved.backup
+
+# Xcode / Apple build products
+DerivedData/
+build/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcuserstate
+
+# Packaged app / archives / symbols
+*.app/
+*.dSYM/
+*.dSYM.zip
+*.ipa
+*.xcarchive
+*.pkg
+*.dmg
+
+# Logs and transient diagnostics
+*.log
+*.trace
+*.xcresult/
+
+# Agent-authored working documents
+docs/analysis/
+docs/designs/
+docs/investigations/
+docs/references/
+docs/reviews/
+docs/plans/*
+!docs/plans/test-coverage-value-audit-2026-05-29.md
+
+# Python cache artifacts
+__pycache__/
+*.pyc
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+
+# Editor / local env
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/

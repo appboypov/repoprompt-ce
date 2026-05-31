@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Focused tests for conductor interactive app lifecycle intent."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import conductor  # noqa: E402
+
+
+class LifecycleTestCase(unittest.TestCase):
+    def make_state(self) -> tuple[tempfile.TemporaryDirectory[str], conductor.DaemonState]:
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        jobs_dir = root / "jobs"
+        jobs_dir.mkdir()
+        paths = conductor.Paths(
+            repo_root=root,
+            repo_hash="test",
+            state_dir=root,
+            socket_path=root / "conductor.sock",
+            pid_path=root / "conductor.pid",
+            lock_path=root / "conductor.lock",
+            jobs_dir=jobs_dir,
+            daemon_log_path=root / "daemon.log",
+            daemon_meta_path=root / "daemon.json",
+            running_processes_path=root / "running.json",
+        )
+        return tmp, conductor.DaemonState(paths)
+
+    def make_job(
+        self,
+        state: conductor.DaemonState,
+        ticket: str,
+        operation: str,
+        args: dict,
+        lanes: list[str],
+        job_state: str = "queued",
+        request_key: str | None = None,
+        fingerprint: str = "fingerprint",
+    ) -> conductor.Job:
+        return conductor.Job(
+            ticket=ticket,
+            request_key=request_key,
+            fingerprint=fingerprint,
+            operation=operation,
+            args=args,
+            lanes=lanes,
+            timeout=None,
+            verbose=False,
+            env={},
+            created_at=conductor.now(),
+            log_path=state.paths.jobs_dir / f"{ticket}.log",
+            state=job_state,
+        )
+
+
+class LifecycleQueueTests(LifecycleTestCase):
+    def test_app_relaunch_cli_requires_delimiter_and_forwards_arguments(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "app", ["relaunch", "--", "--demo"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[1], "app")
+        self.assertEqual(enqueue.call_args.args[2], {"subcommand": "relaunch", "appArgs": ["--demo"]})
+        with self.assertRaises(conductor.ConductorError):
+            conductor.handle_real_operation(state.paths, "app", ["relaunch", "--demo"])
+
+    def test_app_relaunch_delegates_run_script_with_run_lanes_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            argv, lanes, _cwd, _env, timeout = registry.prepare(
+                {"operation": "app", "args": {"subcommand": "relaunch", "appArgs": ["--demo"]}}
+            )
+            _guarded_argv, _guarded_lanes, _guarded_cwd, guarded_env, _guarded_timeout = registry.prepare(
+                {"operation": "app", "args": {"subcommand": "relaunch", "appArgs": [], "guardDelayedLaunch": True}}
+            )
+
+        self.assertEqual(Path(argv[-2]).name, "run.sh")
+        self.assertEqual(Path(argv[-2]).parent.name, "Scripts")
+        self.assertEqual(argv[-1], "--demo")
+        self.assertEqual(lanes, ["build", "debugArtifact", "liveApp"])
+        self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+        self.assertEqual(guarded_env["REPOPROMPT_GUARD_DELAYED_LAUNCH"], "1")
+        self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
+
+    def test_app_stop_supersedes_queued_live_app_but_not_build_only_work(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        old_run = self.make_job(state, "old-run", "run", {}, ["build", "debugArtifact", "liveApp"])
+        build = self.make_job(state, "build", "build", {}, ["build"])
+        state.jobs = {old_run.ticket: old_run, build.ticket: build}
+        state.queue = [old_run.ticket, build.ticket]
+
+        with mock.patch.object(state, "_schedule_locked"):
+            payload = state.enqueue({"operation": "app", "args": {"subcommand": "stop"}})
+
+        self.assertEqual(old_run.state, "canceled")
+        self.assertEqual(old_run.exit_code, 130)
+        self.assertEqual(old_run.superseded_by_operation, "app stop")
+        self.assertEqual(build.state, "queued")
+        self.assertEqual(payload["supersededJobs"][0]["ticket"], old_run.ticket)
+
+    def test_app_relaunch_supersedes_queued_run(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        old_run = self.make_job(state, "old-run", "run", {}, ["build", "debugArtifact", "liveApp"])
+        state.jobs[old_run.ticket] = old_run
+        state.queue.append(old_run.ticket)
+
+        with mock.patch.object(state, "_schedule_locked"):
+            payload = state.enqueue({"operation": "app", "args": {"subcommand": "relaunch", "appArgs": []}})
+
+        self.assertEqual(old_run.state, "canceled")
+        self.assertEqual(old_run.superseded_by_operation, "app relaunch")
+        self.assertEqual(payload["operationLabel"], "app relaunch")
+
+    def test_running_launch_is_cancellation_requested_and_retains_lane_for_stop(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        old_run = self.make_job(state, "running-run", "run", {}, ["build", "debugArtifact", "liveApp"], "running")
+        old_run.process_pid = 123
+        state.jobs[old_run.ticket] = old_run
+        state.active_lanes = {lane: old_run.ticket for lane in old_run.lanes}
+
+        with mock.patch.object(state, "_terminate_process_group_locked") as terminate, mock.patch.object(
+            state, "_schedule_locked"
+        ), mock.patch.object(conductor.threading, "Thread"):
+            payload = state.enqueue({"operation": "app", "args": {"subcommand": "stop"}})
+
+        stop = state.jobs[payload["ticket"]]
+        self.assertTrue(old_run.cancel_requested)
+        self.assertEqual(old_run.state, "running")
+        self.assertEqual(state.active_lanes["liveApp"], old_run.ticket)
+        self.assertTrue(stop.args["guardDelayedLaunch"])
+        terminate.assert_called_once()
+
+    def test_superseded_job_without_pid_is_signaled_after_delayed_assignment_then_escalated(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        old_run = self.make_job(state, "delayed-pid-run", "run", {}, ["build", "debugArtifact", "liveApp"], "running")
+        state.jobs[old_run.ticket] = old_run
+        state.active_lanes = {lane: old_run.ticket for lane in old_run.lanes}
+        real_thread = threading.Thread
+
+        with mock.patch.object(state, "_terminate_process_group_locked") as terminate, mock.patch.object(
+            state, "_kill_process_group_locked"
+        ) as kill, mock.patch.object(state, "_schedule_locked"), mock.patch.object(
+            conductor, "TERMINATE_GRACE_SECONDS", 0.01
+        ), mock.patch.object(conductor.threading, "Thread") as thread_factory:
+            state.enqueue({"operation": "app", "args": {"subcommand": "stop"}})
+            terminate.assert_not_called()
+            target = thread_factory.call_args.kwargs["target"]
+            args = thread_factory.call_args.kwargs["args"]
+            self.assertFalse(args[2])
+            worker = real_thread(target=target, args=args)
+            worker.start()
+            time.sleep(0.03)
+            terminate.assert_not_called()
+            kill.assert_not_called()
+            with state.condition:
+                old_run.process_pid = 456
+                state.condition.notify_all()
+            worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        terminate.assert_called_once()
+        self.assertIs(terminate.call_args.args[0], old_run)
+        kill.assert_called_once()
+        self.assertIs(kill.call_args.args[0], old_run)
+
+    def test_outstanding_launch_guard_propagates_to_newer_lifecycle_intents(self) -> None:
+        for subcommand in ["stop", "relaunch"]:
+            with self.subTest(subcommand=subcommand):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                guarded = self.make_job(
+                    state,
+                    "guarded-stop",
+                    "app",
+                    {"subcommand": "stop", "guardDelayedLaunch": True},
+                    ["liveApp"],
+                )
+                state.jobs[guarded.ticket] = guarded
+                state.queue.append(guarded.ticket)
+                args = {"subcommand": subcommand}
+                if subcommand == "relaunch":
+                    args["appArgs"] = []
+
+                with mock.patch.object(state, "_schedule_locked"):
+                    payload = state.enqueue({"operation": "app", "args": args})
+
+                self.assertTrue(state.jobs[payload["ticket"]].args["guardDelayedLaunch"])
+
+    def test_ordinary_run_remains_fifo_and_does_not_supersede(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        prior = self.make_job(state, "prior", "run", {}, ["build", "debugArtifact", "liveApp"])
+        state.jobs[prior.ticket] = prior
+        state.queue.append(prior.ticket)
+
+        with mock.patch.object(state, "_schedule_locked"):
+            payload = state.enqueue({"operation": "run", "args": {"appArgs": []}})
+
+        self.assertEqual(prior.state, "queued")
+        self.assertFalse(prior.cancel_requested)
+        self.assertEqual(payload.get("supersededJobs"), [])
+
+    def test_request_key_reuse_is_checked_before_supersession(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        request = {"operation": "app", "args": {"subcommand": "relaunch", "appArgs": []}, "requestKey": "interactive"}
+        fingerprint = state.registry.fingerprint(request)
+        existing = self.make_job(
+            state,
+            "existing",
+            "app",
+            {"subcommand": "relaunch", "appArgs": []},
+            ["build", "debugArtifact", "liveApp"],
+            request_key="interactive",
+            fingerprint=fingerprint,
+        )
+        victim = self.make_job(state, "victim", "run", {}, ["build", "debugArtifact", "liveApp"])
+        state.jobs = {existing.ticket: existing, victim.ticket: victim}
+        state.queue = [existing.ticket, victim.ticket]
+        state.request_keys["interactive"] = existing.ticket
+
+        payload = state.enqueue(request)
+
+        self.assertTrue(payload["reused"])
+        self.assertFalse(victim.cancel_requested)
+
+    def test_request_key_mismatch_has_no_supersession_side_effect(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        existing = self.make_job(state, "keyed", "build", {}, ["build"], request_key="interactive", fingerprint="other")
+        victim = self.make_job(state, "victim", "run", {}, ["build", "debugArtifact", "liveApp"])
+        state.jobs = {existing.ticket: existing, victim.ticket: victim}
+        state.queue = [existing.ticket, victim.ticket]
+        state.request_keys["interactive"] = existing.ticket
+
+        with self.assertRaises(conductor.ConductorError):
+            state.enqueue({"operation": "app", "args": {"subcommand": "stop"}, "requestKey": "interactive"})
+
+        self.assertFalse(victim.cancel_requested)
+        self.assertEqual(victim.state, "queued")
+
+    def test_queued_payload_identifies_active_lane_blocker(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        active = self.make_job(state, "build-active", "build", {}, ["build"], "running")
+        waiting = self.make_job(state, "relaunch", "app", {"subcommand": "relaunch"}, ["build", "debugArtifact", "liveApp"])
+        state.jobs = {active.ticket: active, waiting.ticket: waiting}
+        state.active_lanes = {"build": active.ticket}
+        state.queue = [waiting.ticket]
+
+        payload = state.job_status(waiting.ticket, None)
+
+        self.assertEqual(payload["blockedBy"][0]["ticket"], active.ticket)
+        self.assertEqual(payload["blockedBy"][0]["conflictingLanes"], ["build"])
+
+
+class RunScriptTransitionTests(unittest.TestCase):
+    def test_guarded_failed_relaunch_does_not_stop_existing_app_before_packaging_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "Scripts"
+            scripts.mkdir()
+            run_script = scripts / "run.sh"
+            shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
+            run_script.chmod(0o755)
+            package_script = scripts / "package_app.sh"
+            package_script.write_text("#!/usr/bin/env bash\necho package failed\nexit 23\n", encoding="utf-8")
+            package_script.chmod(0o755)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "pgrep").write_text("#!/usr/bin/env bash\necho 4242\n", encoding="utf-8")
+            (bin_dir / "pkill").write_text("#!/usr/bin/env bash\necho invoked > \"$PKILL_MARKER\"\n", encoding="utf-8")
+            (bin_dir / "pgrep").chmod(0o755)
+            (bin_dir / "pkill").chmod(0o755)
+            marker = root / "pkill-invoked"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "PKILL_MARKER": str(marker),
+                    "REPOPROMPT_GUARD_DELAYED_LAUNCH": "1",
+                }
+            )
+
+            result = subprocess.run(["bash", str(run_script)], env=env, text=True, capture_output=True, timeout=2)
+            pkill_invoked = marker.exists()
+
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("Packaging debug app", result.stdout)
+        self.assertNotIn("Stopping existing RepoPrompt instance", result.stdout)
+        self.assertFalse(pkill_invoked)
+
+
+class StopConfirmationTests(unittest.TestCase):
+    def test_delayed_guard_exceeds_run_launch_observation_window(self) -> None:
+        self.assertGreater(conductor.APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS, 10.0)
+        self.assertGreater(conductor.APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS, conductor.APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS)
+
+    def patched_timing(self):
+        return mock.patch.multiple(
+            conductor,
+            APP_STOP_POLL_SECONDS=0.001,
+            APP_STOP_QUIET_SECONDS=0.002,
+            APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS=0.004,
+            APP_STOP_CONFIRM_TIMEOUT_SECONDS=0.02,
+            APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS=0.02,
+        )
+
+    def test_already_stopped_is_confirmed_without_termination(self) -> None:
+        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", return_value=[]), mock.patch.object(
+            conductor, "run_operation_command"
+        ) as terminate, contextlib.redirect_stdout(io.StringIO()):
+            code = conductor.operation_app_stop(Path.cwd(), {})
+
+        self.assertEqual(code, 0)
+        terminate.assert_not_called()
+
+    def test_running_process_is_terminated_then_confirmed_absent(self) -> None:
+        probes = iter([["101"], [], [], [], []])
+        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", side_effect=lambda: next(probes, [])), mock.patch.object(
+            conductor, "run_operation_command", return_value=(0, "", "")
+        ) as terminate, contextlib.redirect_stdout(io.StringIO()):
+            code = conductor.operation_app_stop(Path.cwd(), {})
+
+        self.assertEqual(code, 0)
+        terminate.assert_called_once()
+
+    def test_guarded_stop_terminates_delayed_process_appearance(self) -> None:
+        calls = 0
+
+        def probe() -> list[str]:
+            nonlocal calls
+            calls += 1
+            return ["202"] if calls == 2 else []
+
+        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", side_effect=probe), mock.patch.object(
+            conductor, "run_operation_command", return_value=(0, "", "")
+        ) as terminate, contextlib.redirect_stdout(io.StringIO()):
+            code = conductor.operation_app_stop(Path.cwd(), {"guardDelayedLaunch": True})
+
+        self.assertEqual(code, 0)
+        terminate.assert_called_once()
+
+    def test_persistent_process_fails_confirmation_without_force_kill(self) -> None:
+        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", return_value=["303"]), mock.patch.object(
+            conductor, "run_operation_command", return_value=(0, "", "")
+        ) as terminate, contextlib.redirect_stdout(io.StringIO()):
+            code = conductor.operation_app_stop(Path.cwd(), {})
+
+        self.assertEqual(code, 1)
+        self.assertGreater(terminate.call_count, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

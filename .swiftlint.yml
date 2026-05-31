@@ -1,0 +1,62 @@
+# RepoPrompt CE SwiftLint policy.
+# Scripts/swift_style.sh owns the canonical first-party Swift file list used by
+# local and CI checks. The include/exclude lists here mirror that scope for
+# direct SwiftLint invocations and editor integrations.
+
+included:
+  - Package.swift
+  - Sources/RepoPrompt
+  - Sources/RepoPromptMCP
+  - Sources/RepoPromptShared
+  - Tests/RepoPromptTests
+  - Packages/RepoPromptAgentProviders/Package.swift
+  - Packages/RepoPromptAgentProviders/Sources
+  - Packages/RepoPromptAgentProviders/Tests
+
+excluded:
+  - .build
+  - .swiftpm
+  - DerivedData
+  - build
+  - Vendor
+  - Packages/RepoPromptAgentProviders/.build
+  - Sources/CSwiftPCRE2
+  - Sources/RepoPromptC
+  - Sources/RepoPrompt/ThirdParty/SwiftPCRE2
+
+# Keep the initial integration intentionally humane. Broader cleanup-oriented
+# rules are deferred until the one-time baseline and future focused cleanup work.
+only_rules:
+  # Whitespace and punctuation.
+  - colon
+  - comma
+  # Deferred because SwiftFormat's configured before-first wrapping puts braces
+  # for multiline clauses on the next line, which conflicts with SwiftLint's
+  # opening_brace / statement_position expectations in the current baseline.
+  - function_name_whitespace
+  - return_arrow_whitespace
+  - trailing_newline
+  - trailing_semicolon
+  - vertical_whitespace
+
+  # Low-noise Swift idioms.
+  - empty_parameters
+  - empty_parentheses_with_trailing_closure
+  - redundant_string_enum_value
+  - redundant_void_return
+  - unneeded_break_in_switch
+  - unused_enumerated
+  - void_return
+
+  # Imports and diagnostics hygiene.
+  - unused_import
+
+# Deferred for later cleanup plans: line/file/type/function length, complexity,
+# force unwrap/try/cast, implicitly unwrapped optionals, unowned captures,
+# strict naming rules, broad optional-binding/empty-count idiom cleanup,
+# discardable-let cleanup, sorted imports, empty enum argument cleanup,
+# fatalError message cleanup, prompt-string leading/trailing whitespace, and
+# SwiftLint brace/statement-position rules that currently conflict with
+# SwiftFormat wrapping.
+
+reporter: "xcode"

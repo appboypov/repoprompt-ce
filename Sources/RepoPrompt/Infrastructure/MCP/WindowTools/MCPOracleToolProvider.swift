@@ -1,0 +1,165 @@
+import Foundation
+import JSONSchema
+import MCP
+import Ontology
+
+@MainActor
+final class MCPOracleToolProvider: MCPWindowToolProviding {
+    let group: MCPWindowToolGroup = .oracle
+
+    private let runtime: MCPWindowToolRuntime
+    private let dependencies: MCPWindowToolDependencies
+
+    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+        self.runtime = runtime
+        self.dependencies = dependencies
+    }
+
+    func buildTools() -> [Tool] {
+        [
+            oracleUtilsTool(),
+            askOracleTool(),
+            oracleSendTool(),
+            oracleChatLogTool()
+        ]
+    }
+
+    private func oracleUtilsTool() -> Tool {
+        runtime.tool(
+            name: MCPWindowToolName.oracleUtils,
+            description: """
+            Oracle helper utilities.
+
+            Use this for read-only oracle-specific helpers:
+            - `op="models"`   → list model choices relevant to oracle sends
+            - `op="sessions"` → list oracle/chat sessions for the current workspace. Pass context_id to filter to a specific context's sessions.
+
+            Use `ask_oracle` for all send/continue turns.
+            """,
+            inputSchema: .object(
+                properties: [
+                    "op": .string(description: "Helper operation", enum: ["models", "sessions"]),
+                    "limit": .integer(description: "Maximum sessions to return for the sessions operation"),
+                    "scope": .string(description: "Filter scope: 'workspace' (default) or 'tab'. Auto-inferred when context_id is provided."),
+                    "context_id": .string(description: "Context UUID to filter to a specific context's sessions. Use bind_context op=list to discover values.")
+                ],
+                required: ["op"]
+            )
+        ) { [dependencies] _, args in
+            try await dependencies.executeOracleUtils(args)
+        }
+    }
+
+    private func askOracleTool() -> Tool {
+        runtime.tool(
+            name: MCPWindowToolName.askOracle,
+            description: """
+            Agent-mode oracle send/continue tool.
+
+            Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.
+
+            Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
+
+            Use `oracle_chat_log` after compaction to recover recent oracle messages.
+            """,
+            annotations: .repoPromptLocalEphemeralState,
+            inputSchema: .object(
+                properties: [
+                    "message": .string(
+                        description: "Your message to send",
+                        minLength: 1
+                    ),
+                    "mode": .string(
+                        description: "Operation mode",
+                        default: "chat",
+                        enum: ["chat", "plan", "review"]
+                    ),
+                    "chat_id": .string(
+                        description: "Continue a specific chat in the current agent tab"
+                    ),
+                    "new_chat": .boolean(
+                        description: "Start a new chat session (default: false; discouraged)"
+                    ),
+                    "export_response": .boolean(
+                        description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
+                    )
+                ],
+                required: ["message"]
+            )
+        ) { [dependencies] _, args in
+            try await dependencies.executeAskOracle(args)
+        }
+    }
+
+    private func oracleSendTool() -> Tool {
+        runtime.tool(
+            name: MCPWindowToolName.oracleSend,
+            description: """
+            Consult a second AI for planning, review, or questions.
+
+            Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode.
+            Use `oracle_utils` for passive helpers like models and sessions.
+
+            Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
+
+            Build context first with file reads, `manage_selection`, or `workspace_context`.
+            """,
+            annotations: .repoPromptLocalEphemeralState,
+            inputSchema: .object(
+                properties: [
+                    "message": .string(
+                        description: "Your message to send",
+                        minLength: 1
+                    ),
+                    "mode": .string(
+                        description: "Operation mode",
+                        default: "chat",
+                        enum: ["chat", "plan", "review"]
+                    ),
+                    "chat_id": .string(
+                        description: "Continue a specific chat in the current tab or current context"
+                    ),
+                    "new_chat": .boolean(
+                        description: "Start a new chat session (default: false; discouraged)"
+                    ),
+                    "model": .string(
+                        description: "Model preset ID or name override"
+                    ),
+                    "export_response": .boolean(
+                        description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
+                    )
+                ],
+                required: ["message"]
+            )
+        ) { [dependencies] _, args in
+            try await dependencies.executeOracleSend(args)
+        }
+    }
+
+    private func oracleChatLogTool() -> Tool {
+        runtime.tool(
+            name: MCPWindowToolName.oracleChatLog,
+            description: """
+            Read recent Oracle conversation messages to recover context during agent mode.
+
+            Returns the tail of an Oracle chat as lightweight `{ role, text }` objects. Available only during agent mode runs.
+
+            **Parameters**:
+            - `chat_id` (optional): Target a specific Oracle chat (short ID or UUID). Omit to read the most recent one.
+            - `limit` (optional): Number of messages to return (default: 8, range: 1–50)
+            - `include_user` (optional): Include your own messages in output (default: false)
+            """,
+            annotations: .repoPromptLocalReadOnly,
+            inputSchema: .object(
+                properties: [
+                    "chat_id": .string(description: "Chat ID (short ID or UUID) to read"),
+                    "limit": .integer(description: "Max number of messages to return (default: 8, min: 1, max: 50)"),
+                    "include_user": .boolean(description: "Include user messages in output (default: false)")
+                ],
+                required: []
+            )
+        ) { [dependencies] _, args in
+            try await dependencies.executeOracleChatLog(args)
+        }
+    }
+}

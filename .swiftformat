@@ -1,0 +1,19 @@
+# RepoPrompt CE SwiftFormat policy.
+# The canonical first-party Swift path list lives in Scripts/swift_style.sh.
+# These exclusions mirror that script so broad/manual swiftformat runs avoid
+# generated, vendored, C, binary, and transient paths.
+# Large workflow prompt body files are excluded because SwiftFormat 0.61.1 exits
+# while parsing their embedded multiline skill strings; metadata/catalog files in
+# the same directory remain formatted.
+--swiftversion 6.0
+--indent 4
+--semicolons never
+--trimwhitespace always
+--stripunusedargs closure-only
+--self remove
+--commas inline
+--wraparguments before-first
+--wrapcollections before-first
+--maxwidth none
+
+--exclude .build,.swiftpm,DerivedData,build,Vendor,Packages/RepoPromptAgentProviders/.build,Sources/CSwiftPCRE2,Sources/RepoPromptC,Sources/RepoPrompt/ThirdParty/SwiftPCRE2,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift,Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift
