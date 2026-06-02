@@ -270,6 +270,98 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         XCTAssertEqual(Set(snapshot.files.map(\.standardizedRelativePath)), ["LateA.swift", "Nested/LateB.swift", "Seed.swift"])
     }
 
+    #if DEBUG
+        func testEnsureIndexedFilesSkipsEligibleFileWhenRootUnloadsDuringEligibilitySuspension() async throws {
+            let root = try makeTemporaryRoot(name: "EnsureIndexedUnloadDuringEligibility")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            _ = await store.searchCatalogSnapshot(rootScope: .allLoaded)
+            let lateURL = root.appendingPathComponent("Late.swift")
+            try write("late", to: lateURL)
+
+            let eligibilityGate = AsyncGate()
+            let recordID = record.id
+            let latePath = lateURL.path
+            await store.setEnsureIndexedFilesEligibilityDidResolveHandler { rootID, fullPath in
+                guard rootID == recordID, fullPath == latePath else { return }
+                await eligibilityGate.markStartedAndWaitForRelease()
+            }
+            let ensureTask = Task {
+                await store.ensureIndexedFiles(paths: [latePath])
+            }
+            await eligibilityGate.waitUntilStarted()
+
+            await store.unloadRoot(id: recordID)
+            await eligibilityGate.release()
+            let indexed = await ensureTask.value
+            await store.setEnsureIndexedFilesEligibilityDidResolveHandler(nil)
+
+            XCTAssertTrue(indexed.isEmpty)
+            let roots = await store.roots()
+            XCTAssertTrue(roots.isEmpty)
+            let rootRecords = await store.rootRecords(forRootFolderPaths: [root.path])
+            XCTAssertTrue(rootRecords.isEmpty)
+            let lateFile = await store.file(rootID: recordID, relativePath: "Late.swift")
+            XCTAssertNil(lateFile)
+            let exactLookup = await store.lookupPath(rootID: recordID, relativePath: "Late.swift")
+            XCTAssertNil(exactLookup)
+            let snapshot = await store.searchCatalogSnapshot(rootScope: .allLoaded)
+            XCTAssertFalse(snapshot.roots.contains { $0.id == recordID })
+            XCTAssertFalse(snapshot.files.contains { $0.standardizedFullPath == latePath })
+        }
+
+        func testEnsureIndexedFilesPreservesConcurrentRootLocalMutationDuringEligibilitySuspension() async throws {
+            let root = try makeTemporaryRoot(name: "EnsureIndexedConcurrentMutation")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            _ = await store.searchCatalogSnapshot(rootScope: .allLoaded)
+            let targetURL = root.appendingPathComponent("Target.swift")
+            let concurrentURL = root.appendingPathComponent("Nested/Concurrent.swift")
+            try write("target", to: targetURL)
+            try write("concurrent", to: concurrentURL)
+
+            let eligibilityGate = AsyncGate()
+            let recordID = record.id
+            let targetPath = targetURL.path
+            await store.setEnsureIndexedFilesEligibilityDidResolveHandler { rootID, fullPath in
+                guard rootID == recordID, fullPath == targetPath else { return }
+                await eligibilityGate.markStartedAndWaitForRelease()
+            }
+            let targetTask = Task {
+                await store.ensureIndexedFiles(paths: [targetPath])
+            }
+            await eligibilityGate.waitUntilStarted()
+
+            let concurrentIndexed = await store.ensureIndexedFiles(paths: [concurrentURL.path])
+            XCTAssertEqual(concurrentIndexed, [concurrentURL.path])
+            await eligibilityGate.release()
+            let targetIndexed = await targetTask.value
+            await store.setEnsureIndexedFilesEligibilityDidResolveHandler(nil)
+
+            XCTAssertEqual(targetIndexed, [targetPath])
+            let targetFile = await store.file(rootID: recordID, relativePath: "Target.swift")
+            XCTAssertNotNil(targetFile)
+            let concurrentFile = await store.file(rootID: recordID, relativePath: "Nested/Concurrent.swift")
+            XCTAssertNotNil(concurrentFile)
+            let files = await store.files(inRoot: recordID)
+            XCTAssertEqual(files.map(\.standardizedRelativePath), ["Nested/Concurrent.swift", "Seed.swift", "Target.swift"])
+            let snapshot = await store.searchCatalogSnapshot(rootScope: .allLoaded)
+            XCTAssertEqual(Set(snapshot.files.map(\.standardizedRelativePath)), ["Nested/Concurrent.swift", "Seed.swift", "Target.swift"])
+
+            let rootChildrenSnapshot = await store.directFolderChildren(rootID: recordID)
+            let rootChildren = try XCTUnwrap(rootChildrenSnapshot)
+            XCTAssertEqual(rootChildren.childFolders.map(\.standardizedRelativePath), ["Nested"])
+            XCTAssertEqual(rootChildren.childFiles.map(\.standardizedRelativePath), ["Seed.swift", "Target.swift"])
+            let nestedChildrenSnapshot = await store.directFolderChildren(rootID: recordID, relativePath: "Nested")
+            let nestedChildren = try XCTUnwrap(nestedChildrenSnapshot)
+            XCTAssertEqual(nestedChildren.childFiles.map(\.standardizedRelativePath), ["Nested/Concurrent.swift"])
+        }
+    #endif
+
     func testSearchCatalogSnapshotCacheKeepsManagedOnlyIgnoredFileHiddenAndReflectsPromotion() async throws {
         let root = try makeTemporaryRoot(name: "SearchSnapshotManagedOnlyPromotion")
         try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))

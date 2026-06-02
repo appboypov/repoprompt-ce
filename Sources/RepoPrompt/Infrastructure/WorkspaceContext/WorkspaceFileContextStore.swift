@@ -119,6 +119,7 @@ actor WorkspaceFileContextStore {
         private var rootLoadWillStartHandler: (@Sendable (String) async -> Void)?
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
+        private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
 
         func setRootLoadWillStartHandler(_ handler: (@Sendable (String) async -> Void)?) {
             rootLoadWillStartHandler = handler
@@ -130,6 +131,10 @@ actor WorkspaceFileContextStore {
 
         func setRootUnloadDidDetachHandler(_ handler: (@Sendable ([String]) async -> Void)?) {
             rootUnloadDidDetachHandler = handler
+        }
+
+        func setEnsureIndexedFilesEligibilityDidResolveHandler(_ handler: (@Sendable (UUID, String) async -> Void)?) {
+            ensureIndexedFilesEligibilityDidResolveHandler = handler
         }
     #endif
 
@@ -683,28 +688,45 @@ actor WorkspaceFileContextStore {
             let fullPath = StandardizedPath.absolute(rawPath)
             guard fileIDsByStandardizedFullPath[fullPath] == nil,
                   let root = loadedRoot(containing: fullPath),
-                  var state = rootStatesByID[root.id]
+                  let service = rootStatesByID[root.id]?.service
             else { continue }
+            let originalRootID = root.id
+            let originalRootPath = root.standardizedFullPath
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
-            let relativePath = relativePath(for: fullPath, rootPath: root.standardizedFullPath)
+            let relativePath = relativePath(for: fullPath, rootPath: originalRootPath)
             guard !relativePath.isEmpty,
-                  await state.service.catalogEligibleRegularFileExists(relativePath: relativePath)
+                  await service.catalogEligibleRegularFileExists(relativePath: relativePath)
+            else { continue }
+            #if DEBUG
+                if let ensureIndexedFilesEligibilityDidResolveHandler {
+                    await ensureIndexedFilesEligibilityDidResolveHandler(originalRootID, fullPath)
+                }
+            #endif
+            guard fileIDsByStandardizedFullPath[fullPath] == nil,
+                  folderIDsByStandardizedFullPath[fullPath] == nil,
+                  var state = rootStatesByID[originalRootID],
+                  state.root.id == originalRootID,
+                  state.root.standardizedFullPath == originalRootPath,
+                  rootIDsByStandardizedPath[originalRootPath] == originalRootID,
+                  loadedRoot(containing: fullPath)?.id == originalRootID,
+                  state.fileIDsByRelativePath[relativePath] == nil,
+                  state.folderIDsByRelativePath[relativePath] == nil
             else { continue }
             var indexes = RootIndexBuffers()
             let hierarchy = relativePath.split(separator: "/").count
             indexFiles(
                 [FSItemDTO(relativePath: relativePath, isDirectory: false, hierarchy: hierarchy)],
-                root: root,
+                root: state.root,
                 state: &state,
                 indexes: &indexes
             )
             guard !indexes.filesByID.isEmpty else { continue }
             commit(indexes)
-            rootStatesByID[root.id] = state
+            rootStatesByID[originalRootID] = state
             clearSearchCatalogSnapshotCache()
             indexed.append(fullPath)
-            upsertedFilesByRoot[root.id, default: []].append(contentsOf: indexes.filesByID.values)
+            upsertedFilesByRoot[originalRootID, default: []].append(contentsOf: indexes.filesByID.values)
         }
         if !indexed.isEmpty {
             let affectedKinds = Set(upsertedFilesByRoot.keys.compactMap { rootStatesByID[$0]?.root.kind })

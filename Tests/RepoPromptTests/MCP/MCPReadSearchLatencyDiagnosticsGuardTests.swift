@@ -96,7 +96,7 @@
             XCTAssertTrue(store.contains("private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]"))
             XCTAssertTrue(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
             XCTAssertTrue(store.contains("private func clearSearchCatalogSnapshotCache() {\n        searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)\n    }"))
-            XCTAssertTrue(store.contains("rootStatesByID[root.id] = state\n            clearSearchCatalogSnapshotCache()\n            indexed.append(fullPath)"))
+            XCTAssertTrue(store.contains("rootStatesByID[originalRootID] = state\n            clearSearchCatalogSnapshotCache()\n            indexed.append(fullPath)"))
             XCTAssertTrue(store.contains("guard !statesToUnload.isEmpty else { return }\n        clearSearchCatalogSnapshotCache()\n        #if DEBUG"))
             XCTAssertTrue(store.contains("bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)\n        clearSearchCatalogSnapshotCache()\n        invalidatePathMatchCache()"))
             XCTAssertTrue(store.contains("#endif\n        invalidatePathMatchCache()\n        finishRootUnload(for: unloadingPaths)"))
