@@ -597,6 +597,32 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(marker.exists())
 
+    def test_mcp_cli_version_sync_updates_source_and_check_detects_drift(self) -> None:
+        root = self.make_metadata_root()
+        source = root / "Sources" / "RepoPromptMCP" / "main.swift"
+        source.parent.mkdir(parents=True)
+        source.write_text('let CLI_VERSION = "9.9.9"\n', encoding="utf-8")
+        env = os.environ.copy()
+        env["REPOPROMPT_RELEASE_SOURCE_ROOT"] = str(root)
+        helper = SCRIPT_DIR / "sync_mcp_cli_version.sh"
+
+        rejected = subprocess.run([str(helper), "--check"], env=env, text=True, capture_output=True)
+        synced = subprocess.run([str(helper)], env=env, text=True, capture_output=True)
+        accepted = subprocess.run([str(helper), "--check"], env=env, text=True, capture_output=True)
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Run ./Scripts/release.sh sync-cli-version", rejected.stderr)
+        self.assertEqual(synced.returncode, 0, synced.stderr)
+        self.assertEqual(source.read_text(encoding="utf-8"), 'let CLI_VERSION = "1.0.0"\n')
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+    def test_release_preflight_requires_synchronized_mcp_cli_version(self) -> None:
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh"', release_script)
+        self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh" --check', release_script)
+        self.assertIn("sync-cli-version) sync_mcp_cli_version", release_script)
+
     def test_remote_release_commit_helper_rejects_moved_tag(self) -> None:
         remote, work = self.make_git_remote()
         first = self.commit_file(work, "first")

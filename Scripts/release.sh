@@ -76,6 +76,7 @@ run_preflight() {
     require_file "$ROOT_DIR/Vendor/Sparkle/SHA256SUMS"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/extract_staged_release.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
@@ -96,9 +97,16 @@ run_preflight() {
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/swiftpm_notice_guardrails.sh"
+    REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh" --check
 
     printf 'OK: release preflight passed for %s %s (%s) with Sparkle %s.\n' \
         "$DISPLAY_NAME" "$MARKETING_VERSION" "$BUILD_NUMBER" "$sparkle_version"
+}
+
+sync_mcp_cli_version() {
+    REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh"
 }
 
 resolve_without_lockfile_drift() {
@@ -427,11 +435,12 @@ publish_signed_test_build() {
 }
 
 case "$MODE" in
+    sync-cli-version) sync_mcp_cli_version ;;
     preflight) run_preflight ;;
     artifact) package_release_candidate ;;
     stage-publish) stage_publish_release ;;
     publish-staged) publish_staged_release ;;
     stage-test-build) stage_signed_test_build ;;
     publish-test-build) publish_signed_test_build ;;
-    *) fail "Usage: $0 preflight|artifact|stage-publish|publish-staged|stage-test-build|publish-test-build" ;;
+    *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged|stage-test-build|publish-test-build" ;;
 esac

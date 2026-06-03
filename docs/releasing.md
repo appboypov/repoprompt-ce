@@ -29,7 +29,8 @@ Developer ID signing job waits on the protected `release` environment.
 
 The intended process is:
 
-1. A contributor opens a release PR that updates `version.env`, release notes,
+1. A contributor updates `version.env`, runs `make release-sync-cli-version`,
+   and opens a release PR with the synchronized MCP CLI version, release notes,
    and any relevant changelog entry.
 2. CI runs ordinary validation plus the secret-free release-candidate lane.
 3. Contributors and maintainers inspect the ad-hoc release-candidate artifact
@@ -207,7 +208,8 @@ the helper `--version` smoke under a minimal environment.
 
 ## Build a draft release
 
-1. Update `version.env` and commit the release state.
+1. Update `version.env`, run `make release-sync-cli-version`, and commit the
+   synchronized release state.
 2. Create and push a tag pointing at that commit.
 3. Dispatch **Publish Release** from protected `main` with the existing tag.
 4. Review and test the draft GitHub Release assets before promotion.
