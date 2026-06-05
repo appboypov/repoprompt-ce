@@ -648,8 +648,6 @@ private struct AgentExecutionLocationPill: View {
         let rowWidth: CGFloat
         let applySelection: (AgentModeViewModel.InitialStartLocation) -> Void
 
-        @State private var isHovered = false
-
         var body: some View {
             Button {
                 guard !isDisabled else { return }
@@ -680,34 +678,44 @@ private struct AgentExecutionLocationPill: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Spacer(minLength: 0)
                 }
-                .frame(width: rowWidth, alignment: .leading)
-                .foregroundStyle(isDisabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(backgroundColor)
-                )
-                .onContinuousHover { phase in
-                    switch phase {
-                    case .active:
-                        isHovered = true
-                    case .ended:
-                        isHovered = false
-                    }
-                }
             }
-            .buttonStyle(.plain)
-            .help(tooltip)
+            .buttonStyle(
+                ExecutionLocationOptionRowButtonStyle(
+                    isSelected: isSelected,
+                    isDisabled: isDisabled,
+                    rowWidth: rowWidth
+                )
+            )
+            .hoverTooltip(tooltip, .top)
             .accessibilityHint(isDisabled ? "Unavailable" : tooltip)
         }
+    }
 
-        private var backgroundColor: Color {
-            if isSelected {
-                return Color.accentColor.opacity(isHovered ? 0.24 : 0.12)
+    private struct ExecutionLocationOptionRowButtonStyle: ButtonStyle {
+        let isSelected: Bool
+        let isDisabled: Bool
+        let rowWidth: CGFloat
+
+        func makeBody(configuration: Configuration) -> some View {
+            HoverableButton(configuration: configuration) { isHovered in
+                configuration.label
+                    .frame(width: rowWidth, alignment: .leading)
+                    .foregroundStyle(isDisabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(backgroundColor(isHovered: isHovered, isPressed: configuration.isPressed))
+                    )
             }
-            return isHovered ? Color.accentColor.opacity(0.14) : .clear
+        }
+
+        private func backgroundColor(isHovered: Bool, isPressed: Bool) -> Color {
+            if isSelected {
+                return Color.accentColor.opacity(isPressed ? 0.28 : (isHovered ? 0.24 : 0.12))
+            }
+            return isPressed ? Color.accentColor.opacity(0.18) : (isHovered ? Color.accentColor.opacity(0.14) : .clear)
         }
     }
 
