@@ -18,12 +18,19 @@ final class FileTagMentionHelper {
     private weak var fileTagSelectionCoordinator: WorkspaceSelectionCoordinator?
     private var fileTagLookupContextIdentity: AnyHashable?
     private var fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)?
+    private var configuration: FileMentionPickerConfiguration = .compact
     private var refreshTask: Task<Void, Never>?
     private var suggestionTask: Task<Void, Never>?
     private var commitFinalizationTask: Task<Void, Never>?
     private var suggestionRequestID: UInt64 = 0
     private var isFinalizingCommittedMention = false
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
+
+    init() {
+        overlay.onRowClicked = { [weak self] _, index in
+            self?.selectSuggestion(at: index)
+        }
+    }
 
     func configure(
         textView: ImageAwareTextView,
@@ -32,7 +39,8 @@ final class FileTagMentionHelper {
         searchService: WorkspaceSearchService?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
         lookupContextIdentity: AnyHashable?,
-        lookupContextProvider: (() async -> WorkspaceLookupContext)?
+        lookupContextProvider: (() async -> WorkspaceLookupContext)?,
+        configuration: FileMentionPickerConfiguration
     ) {
         guard enabled else {
             let hadState = (service != nil || fileTagStore != nil || triggerRange != nil || refreshTask != nil || suggestionTask != nil)
@@ -42,6 +50,7 @@ final class FileTagMentionHelper {
             fileTagSelectionCoordinator = nil
             fileTagLookupContextIdentity = nil
             fileTagLookupContextProvider = nil
+            self.configuration = .compact
             if hadState {
                 dismiss()
             }
@@ -50,22 +59,27 @@ final class FileTagMentionHelper {
 
         var shouldRefreshNow = false
         let lookupContextChanged = lookupContextIdentity != fileTagLookupContextIdentity
-        if service == nil || store !== fileTagStore || searchService !== fileTagSearchService || selectionCoordinator !== fileTagSelectionCoordinator || lookupContextChanged {
-            if lookupContextChanged {
-                dismiss()
-            }
+        let configurationChanged = configuration != self.configuration
+        if lookupContextChanged || configurationChanged {
+            dismiss()
+        }
+        overlay.suggestedWidth = configuration.overlayWidth
+        overlay.visibleRowLimit = configuration.visibleRows
+        if service == nil || store !== fileTagStore || searchService !== fileTagSearchService || selectionCoordinator !== fileTagSelectionCoordinator || lookupContextChanged || configurationChanged {
             service = AgentFileTagSuggestionService(
                 store: store,
                 searchService: searchService,
                 selectionCoordinator: selectionCoordinator,
                 lookupContextProvider: lookupContextProvider,
-                maxResults: 5
+                maxResults: configuration.maxResults,
+                showsFileSubtitles: configuration.showsFileSubtitles
             )
             fileTagStore = store
             fileTagSearchService = searchService
             fileTagSelectionCoordinator = selectionCoordinator
             fileTagLookupContextIdentity = lookupContextIdentity
             fileTagLookupContextProvider = lookupContextProvider
+            self.configuration = configuration
             shouldRefreshNow = true
         }
         if shouldRefreshNow {
@@ -132,6 +146,32 @@ final class FileTagMentionHelper {
         }
         return false
     }
+
+    private func selectSuggestion(at index: Int) {
+        guard suggestions.indices.contains(index) else { return }
+        refreshTask?.cancel()
+        refreshTask = nil
+        suggestionTask?.cancel()
+        suggestionTask = nil
+        suggestionRequestID &+= 1
+        highlightedIndex = index
+    }
+
+    #if DEBUG
+        func setSelectionStateForTesting(
+            suggestions: [MentionSuggestion],
+            highlightedIndex: Int,
+            triggerRange: NSRange
+        ) {
+            self.suggestions = suggestions
+            self.highlightedIndex = highlightedIndex
+            self.triggerRange = triggerRange
+        }
+
+        func clickSuggestionForTesting(at index: Int) {
+            overlay.onRowClicked?(0, index)
+        }
+    #endif
 
     func dismiss() {
         refreshTask?.cancel()
@@ -393,6 +433,12 @@ final class SlashSkillMentionHelper {
     private var suggestionRequestID: UInt64 = 0
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
 
+    init() {
+        overlay.onRowClicked = { [weak self] _, index in
+            self?.selectSuggestion(at: index)
+        }
+    }
+
     func configure(
         textView: ImageAwareTextView,
         enabled: Bool,
@@ -460,6 +506,26 @@ final class SlashSkillMentionHelper {
         }
         return false
     }
+
+    private func selectSuggestion(at index: Int) {
+        guard suggestions.indices.contains(index) else { return }
+        refreshTask?.cancel()
+        refreshTask = nil
+        suggestionTask?.cancel()
+        suggestionTask = nil
+        suggestionRequestID &+= 1
+        highlightedIndex = index
+    }
+
+    #if DEBUG
+        var suggestionsForTesting: [MentionSuggestion] {
+            suggestions
+        }
+
+        func clickSuggestionForTesting(at index: Int) {
+            overlay.onRowClicked?(0, index)
+        }
+    #endif
 
     func dismiss() {
         refreshTask?.cancel()

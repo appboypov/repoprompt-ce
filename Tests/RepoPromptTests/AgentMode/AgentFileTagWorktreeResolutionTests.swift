@@ -13,20 +13,23 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     }
 
     @MainActor
-    func testBoundWorktreeSuggestionIncludesBranchOnlyFileWithLogicalPath() async throws {
+    func testExpandedBoundWorktreeSuggestionUsesLogicalPathAndSubtitle() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: true)
         let lookupContext = await makeLookupContext(fixture: fixture)
+        let configuration = FileMentionPickerConfiguration.expanded
         let service = AgentFileTagSuggestionService(
             store: fixture.store,
             searchService: nil,
             selectionCoordinator: nil,
             lookupContextProvider: { lookupContext },
-            maxResults: 5
+            maxResults: configuration.maxResults,
+            showsFileSubtitles: configuration.showsFileSubtitles
         )
 
         let suggestions = await service.suggestions(for: "BranchOnly")
+        let suggestion = try XCTUnwrap(suggestions.first { $0.relativePath == "Sources/BranchOnly.swift" })
 
-        XCTAssertTrue(suggestions.contains { $0.relativePath == "Sources/BranchOnly.swift" }, String(describing: suggestions))
+        XCTAssertEqual(suggestion.subtitle, "Sources")
         XCTAssertFalse(suggestions.contains { $0.relativePath.contains(".worktrees") }, String(describing: suggestions))
         XCTAssertFalse(suggestions.contains { $0.relativePath.contains(fixture.worktreeRoot.path) }, String(describing: suggestions))
     }
@@ -91,6 +94,65 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         XCTAssertTrue(updated.autoCodemapPaths.isEmpty)
         XCTAssertTrue(updated.slices.isEmpty)
         XCTAssertFalse(updated.selectedPaths.contains { $0.contains(fixture.worktreeRoot.path) })
+    }
+
+    @MainActor
+    func testExpandedAgentFileTagsReturnMoreThanCompactCapWithParentSubtitles() async throws {
+        let root = try makeTemporaryRoot(name: "AgentFileTagExpanded")
+        let matchingFileCount = 80
+        for index in 0 ..< matchingFileCount {
+            let name = String(format: "Match%02d.swift", index)
+            try write("let match\(index) = true\n", to: root.appendingPathComponent("Sources/\(name)"))
+        }
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let config = FileMentionPickerConfiguration.expanded
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: nil,
+            selectionCoordinator: nil,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: config.maxResults,
+            showsFileSubtitles: config.showsFileSubtitles
+        )
+
+        let suggestions = await service.suggestions(for: "Match")
+
+        XCTAssertEqual(suggestions.count, matchingFileCount, String(describing: suggestions))
+        XCTAssertTrue(suggestions.count > FileMentionPickerConfiguration.compact.maxResults)
+        XCTAssertTrue(suggestions.count > 64)
+        XCTAssertTrue(suggestions.allSatisfy { $0.kind == .file })
+        XCTAssertEqual(Set(suggestions.compactMap(\.subtitle)), ["Sources"])
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.hasPrefix("Match") == true })
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.contains("Sources/") == false })
+    }
+
+    @MainActor
+    func testCompactAgentFileTagsPreserveDuplicateDisambiguationSubtitles() async throws {
+        let firstRoot = try makeTemporaryRoot(name: "AgentFileTagDuplicateA")
+        let secondRoot = try makeTemporaryRoot(name: "AgentFileTagDuplicateB")
+        try write("let duplicate = \"a\"\n", to: firstRoot.appendingPathComponent("Sources/Shared.swift"))
+        try write("let duplicate = \"b\"\n", to: secondRoot.appendingPathComponent("Sources/Shared.swift"))
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: firstRoot.path)
+        _ = try await store.loadRoot(path: secondRoot.path)
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: nil,
+            selectionCoordinator: nil,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: FileMentionPickerConfiguration.compact.maxResults,
+            showsFileSubtitles: FileMentionPickerConfiguration.compact.showsFileSubtitles
+        )
+
+        let suggestions = await service.suggestions(for: "Shared")
+
+        XCTAssertEqual(suggestions.count, 2, String(describing: suggestions))
+        XCTAssertEqual(
+            Set(suggestions.compactMap(\.subtitle)),
+            [firstRoot.lastPathComponent, secondRoot.lastPathComponent]
+        )
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.hasSuffix("Sources/Shared.swift") == true })
     }
 
     @MainActor
