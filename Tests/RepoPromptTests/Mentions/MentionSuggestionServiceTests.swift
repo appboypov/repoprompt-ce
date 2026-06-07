@@ -31,6 +31,21 @@ final class MentionSuggestionServiceTests: XCTestCase {
         XCTAssertTrue(rows.allSatisfy { $0.commitDisplayText == nil })
     }
 
+    func testUpdateFileManagerTracksIdentityAndDeallocation() {
+        let first = WorkspaceFilesViewModel()
+        let service = MentionSuggestionService(fileManager: first)
+
+        XCTAssertFalse(service.updateFileManager(first))
+
+        var second: WorkspaceFilesViewModel? = WorkspaceFilesViewModel()
+        XCTAssertTrue(service.updateFileManager(second))
+        XCTAssertFalse(service.updateFileManager(second))
+
+        second = nil
+        XCTAssertTrue(service.updateFileManager(nil))
+        XCTAssertFalse(service.updateFileManager(nil))
+    }
+
     func testSelectedFolderReturnsAllSelectedFilesWithoutCompactCap() throws {
         let fixture = makeFixture(fileCount: 7)
         for file in fixture.files {
@@ -49,7 +64,6 @@ final class MentionSuggestionServiceTests: XCTestCase {
 
     private func makeFixture(fileCount: Int) -> (
         fileManager: WorkspaceFilesViewModel,
-        root: FolderViewModel,
         files: [FileViewModel]
     ) {
         let rootURL = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -86,6 +100,6 @@ final class MentionSuggestionServiceTests: XCTestCase {
 
         let fileManager = WorkspaceFilesViewModel()
         fileManager.addRootFolder(root)
-        return (fileManager, root, files)
+        return (fileManager, files)
     }
 }

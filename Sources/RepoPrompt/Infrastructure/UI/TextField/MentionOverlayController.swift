@@ -10,7 +10,18 @@ final class MentionOverlayController {
         case below
     }
 
+    struct ScreenGeometry: Equatable {
+        let frame: NSRect
+        let visibleFrame: NSRect
+    }
+
+    struct RootPlacementResult: Equatable {
+        let frame: NSRect
+        let placement: Placement
+    }
+
     var placement: Placement = .below
+    var onRowClicked: ((_ level: Int, _ index: Int) -> Void)?
     var suggestedWidth: CGFloat = 240
     var visibleRowLimit: Int = 5 {
         didSet {
@@ -27,6 +38,7 @@ final class MentionOverlayController {
 
     /// Remember latest caret rect so we can re-anchor after every resize.
     private var latestCaretRect: NSRect?
+    private var resolvedPlacement: Placement?
 
     // MARK: – Public API -----------------------------------------------------
 
@@ -72,10 +84,11 @@ final class MentionOverlayController {
         guard let previous = windows.last else { return }
         let w = SuggestionWindow(
             parent: previous.parentTextView,
-            placement: placement,
+            placement: resolvedPlacement ?? placement,
             width: suggestedWidth,
             visibleRowLimit: Self.normalizedVisibleRowLimit(visibleRowLimit)
         )
+        wireRowClick(for: w)
         windows.append(w)
         chainWindow(w, after: previous)
         enforceScreenBounds()
@@ -98,6 +111,7 @@ final class MentionOverlayController {
         windows.removeAll()
         ownerWindow = nil
         latestCaretRect = nil
+        resolvedPlacement = nil
     }
 
     // MARK: – Private --------------------------------------------------------
@@ -114,6 +128,7 @@ final class MentionOverlayController {
             width: suggestedWidth,
             visibleRowLimit: Self.normalizedVisibleRowLimit(visibleRowLimit)
         )
+        wireRowClick(for: root)
         owner.addChildWindow(root, ordered: .above)
         windows.append(root)
     }
@@ -128,40 +143,119 @@ final class MentionOverlayController {
         placement: Placement,
         visibleFrame: NSRect?
     ) -> NSRect {
-        var frame = NSRect(origin: .zero, size: popupSize)
-        switch placement {
-        case .above:
-            frame.origin = NSPoint(x: caret.minX, y: caret.maxY + 4)
-        case .below:
-            frame.origin = NSPoint(x: caret.minX, y: caret.minY - 2 - popupSize.height)
+        resolvedRootPlacement(
+            caret: caret,
+            popupSize: popupSize,
+            placement: placement,
+            visibleFrame: visibleFrame
+        ).frame
+    }
+
+    static func resolvedRootPlacement(
+        caret: NSRect,
+        popupSize: NSSize,
+        placement: Placement,
+        visibleFrame: NSRect?
+    ) -> RootPlacementResult {
+        let preferred = rootFrame(caret: caret, popupSize: popupSize, placement: placement)
+        guard let visibleFrame else {
+            return RootPlacementResult(frame: preferred, placement: placement)
         }
-        return clampedFrame(frame, to: visibleFrame)
+
+        if fitsVertically(preferred, in: visibleFrame) {
+            return RootPlacementResult(
+                frame: clampedFrame(preferred, to: visibleFrame),
+                placement: placement
+            )
+        }
+
+        let alternatePlacement: Placement = placement == .above ? .below : .above
+        let alternate = rootFrame(caret: caret, popupSize: popupSize, placement: alternatePlacement)
+        if fitsVertically(alternate, in: visibleFrame) {
+            return RootPlacementResult(
+                frame: clampedFrame(alternate, to: visibleFrame),
+                placement: alternatePlacement
+            )
+        }
+
+        let preferredArea = visibleIntersectionArea(preferred, visibleFrame)
+        let alternateArea = visibleIntersectionArea(alternate, visibleFrame)
+        if alternateArea > preferredArea {
+            return RootPlacementResult(
+                frame: clampedFrame(alternate, to: visibleFrame),
+                placement: alternatePlacement
+            )
+        }
+        return RootPlacementResult(
+            frame: clampedFrame(preferred, to: visibleFrame),
+            placement: placement
+        )
     }
 
     static func positionedChildFrame(
         after previousFrame: NSRect,
         popupSize: NSSize,
         placement: Placement,
-        visibleFrame: NSRect?
+        visibleFrame: NSRect?,
+        avoiding occupiedFrames: [NSRect] = []
     ) -> NSRect {
-        var frame = NSRect(origin: .zero, size: popupSize)
-        switch placement {
-        case .above:
-            frame.origin = NSPoint(x: previousFrame.maxX + 4, y: previousFrame.minY)
-        case .below:
-            frame.origin = NSPoint(x: previousFrame.maxX - 1, y: previousFrame.maxY - popupSize.height)
-        }
+        let verticalOrigin = placement == .above
+            ? previousFrame.minY
+            : previousFrame.maxY - popupSize.height
+        let gap: CGFloat = 4
+        let occupied = occupiedFrames.isEmpty ? [previousFrame] : occupiedFrames
+        let occupiedUnion = occupied.dropFirst().reduce(occupied[0]) { $0.union($1) }
+        let candidateXPositions = [
+            previousFrame.maxX + gap,
+            previousFrame.minX - popupSize.width - gap,
+            occupiedUnion.maxX + gap,
+            occupiedUnion.minX - popupSize.width - gap
+        ]
 
-        if let visibleFrame,
-           frame.maxX > visibleFrame.maxX
-        {
-            let leftX = previousFrame.minX - popupSize.width - 4
-            if leftX >= visibleFrame.minX {
-                frame.origin.x = leftX
+        var candidates: [NSRect] = []
+        for x in candidateXPositions {
+            let candidate = clampedFrame(
+                NSRect(
+                    x: x,
+                    y: verticalOrigin,
+                    width: popupSize.width,
+                    height: popupSize.height
+                ),
+                to: visibleFrame
+            )
+            if !candidates.contains(candidate) {
+                candidates.append(candidate)
             }
         }
 
-        return clampedFrame(frame, to: visibleFrame)
+        return candidates.enumerated().min { lhs, rhs in
+            let leftOverlap = overlapArea(lhs.element, frames: occupied)
+            let rightOverlap = overlapArea(rhs.element, frames: occupied)
+            return leftOverlap == rightOverlap ? lhs.offset < rhs.offset : leftOverlap < rightOverlap
+        }?.element ?? clampedFrame(NSRect(origin: .zero, size: popupSize), to: visibleFrame)
+    }
+
+    static func selectedVisibleFrame(
+        for caret: NSRect,
+        screens: [ScreenGeometry]
+    ) -> NSRect? {
+        guard !screens.isEmpty else { return nil }
+
+        let intersecting = screens.enumerated().map { index, screen in
+            (index, screen, visibleIntersectionArea(caret, screen.frame))
+        }
+        if let best = intersecting.max(by: { lhs, rhs in
+            lhs.2 == rhs.2 ? lhs.0 > rhs.0 : lhs.2 < rhs.2
+        }), best.2 > 0 {
+            return best.1.visibleFrame
+        }
+
+        let caretCenter = NSPoint(x: caret.midX, y: caret.midY)
+        return screens.enumerated().min { lhs, rhs in
+            let leftDistance = squaredDistance(from: caretCenter, to: lhs.element.frame)
+            let rightDistance = squaredDistance(from: caretCenter, to: rhs.element.frame)
+            return leftDistance == rightDistance ? lhs.offset < rhs.offset : leftDistance < rightDistance
+        }?.element.visibleFrame
     }
 
     static func clampedFrame(_ frame: NSRect, to visibleFrame: NSRect?) -> NSRect {
@@ -174,61 +268,161 @@ final class MentionOverlayController {
             clamped.origin.x = visibleFrame.minX
         }
 
+        return clampedVertically(clamped, to: visibleFrame)
+    }
+
+    private static func rootFrame(
+        caret: NSRect,
+        popupSize: NSSize,
+        placement: Placement
+    ) -> NSRect {
+        let origin = switch placement {
+        case .above:
+            NSPoint(x: caret.minX, y: caret.maxY + 4)
+        case .below:
+            NSPoint(x: caret.minX, y: caret.minY - 2 - popupSize.height)
+        }
+        return NSRect(origin: origin, size: popupSize)
+    }
+
+    private static func fitsVertically(_ frame: NSRect, in visibleFrame: NSRect) -> Bool {
+        frame.minY >= visibleFrame.minY && frame.maxY <= visibleFrame.maxY
+    }
+
+    private static func clampedVertically(_ frame: NSRect, to visibleFrame: NSRect?) -> NSRect {
+        guard let visibleFrame else { return frame }
+        var clamped = frame
         if clamped.height <= visibleFrame.height {
             clamped.origin.y = min(max(clamped.minY, visibleFrame.minY), visibleFrame.maxY - clamped.height)
         } else {
             clamped.origin.y = visibleFrame.minY
         }
-
         return clamped
+    }
+
+    private static func overlapArea(_ frame: NSRect, frames: [NSRect]) -> CGFloat {
+        frames.reduce(0) { $0 + visibleIntersectionArea(frame, $1) }
+    }
+
+    private static func visibleIntersectionArea(_ lhs: NSRect, _ rhs: NSRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        guard !intersection.isNull else { return 0 }
+        return max(intersection.width, 0) * max(intersection.height, 0)
+    }
+
+    private static func squaredDistance(from point: NSPoint, to rect: NSRect) -> CGFloat {
+        let dx = max(max(rect.minX - point.x, 0), point.x - rect.maxX)
+        let dy = max(max(rect.minY - point.y, 0), point.y - rect.maxY)
+        return dx * dx + dy * dy
     }
 
     private func chainWindow(_ w: SuggestionWindow, after prev: NSWindow) {
         let parentWin = prev.parent ?? prev
+        let childPlacement = resolvedPlacement ?? placement
         parentWin.addChildWindow(w, ordered: .above)
         w.orderFront(nil)
+        w.setPlacement(childPlacement)
         w.setFrame(
             Self.positionedChildFrame(
                 after: prev.frame,
                 popupSize: w.frame.size,
-                placement: placement,
-                visibleFrame: visibleFrame
+                placement: childPlacement,
+                visibleFrame: visibleFrame,
+                avoiding: windows.dropLast().map(\.frame)
             ),
             display: true
         )
         w.alphaValue = 1
     }
 
-    private var visibleFrame: NSRect? {
-        ownerWindow?.screen?.visibleFrame
+    private func wireRowClick(for window: SuggestionWindow) {
+        window.onRowClicked = { [weak self, weak window] index in
+            guard let self, let window,
+                  let level = windows.firstIndex(where: { $0 === window })
+            else { return }
+            popToLevel(level)
+            onRowClicked?(level, index)
+        }
     }
+
+    private func popToLevel(_ level: Int) {
+        guard windows.indices.contains(level) else { return }
+        while windows.count > level + 1 {
+            let window = windows.removeLast()
+            window.orderOut(nil)
+            window.parent?.removeChildWindow(window)
+        }
+    }
+
+    private var visibleFrame: NSRect? {
+        #if DEBUG
+            if let visibleFrameOverrideForTesting {
+                return visibleFrameOverrideForTesting
+            }
+        #endif
+        if let caret = latestCaretRect,
+           let selected = Self.selectedVisibleFrame(
+               for: caret,
+               screens: NSScreen.screens.map {
+                   ScreenGeometry(frame: $0.frame, visibleFrame: $0.visibleFrame)
+               }
+           )
+        {
+            return selected
+        }
+        return ownerWindow?.screen?.visibleFrame
+    }
+
+    #if DEBUG
+        var visibleFrameOverrideForTesting: NSRect?
+
+        var testWindowCount: Int {
+            windows.count
+        }
+
+        var testWindowFrames: [NSRect] {
+            windows.map(\.frame)
+        }
+
+        var testWindowPlacements: [Placement] {
+            windows.map(\.placement)
+        }
+
+        func clickRowForTesting(level: Int, index: Int) {
+            guard windows.indices.contains(level) else { return }
+            windows[level].clickRowForTesting(index)
+        }
+    #endif
 
     private func enforceScreenBounds() {
         guard !windows.isEmpty else { return }
         if let root = windows.first,
            let caret = latestCaretRect
         {
-            root.setFrame(
-                Self.positionedRootFrame(
-                    caret: caret,
-                    popupSize: root.frame.size,
-                    placement: placement,
-                    visibleFrame: visibleFrame
-                ),
-                display: true
+            let result = Self.resolvedRootPlacement(
+                caret: caret,
+                popupSize: root.frame.size,
+                placement: placement,
+                visibleFrame: visibleFrame
             )
+            resolvedPlacement = result.placement
+            root.setPlacement(result.placement)
+            root.setFrame(result.frame, display: true)
         }
 
         guard windows.count > 1 else { return }
+        let childPlacement = resolvedPlacement ?? placement
         for idx in 1 ..< windows.count {
             let previous = windows[idx - 1]
             let current = windows[idx]
+            current.setPlacement(childPlacement)
             current.setFrame(
                 Self.positionedChildFrame(
                     after: previous.frame,
                     popupSize: current.frame.size,
-                    placement: placement,
-                    visibleFrame: visibleFrame
+                    placement: childPlacement,
+                    visibleFrame: visibleFrame,
+                    avoiding: windows[..<idx].map(\.frame)
                 ),
                 display: true
             )
@@ -247,11 +441,12 @@ extension MentionOverlayController {
     /// system vibrancy / popover material.
     final class SuggestionWindow: NSWindow {
         weak var parentTextView: MentionTextView?
-        let placement: MentionOverlayController.Placement
+        private(set) var placement: MentionOverlayController.Placement
 
         // SwiftUI bridge
         private let model = MentionSuggestionListModel()
         private var hostingView: NSHostingView<MentionSuggestionListView>?
+        var onRowClicked: ((Int) -> Void)?
 
         // MARK: – Init
 
@@ -311,6 +506,7 @@ extension MentionOverlayController {
             model.onRowClicked = { [weak self] index in
                 guard let self else { return }
                 model.highlightedIndex = index
+                onRowClicked?(index)
             }
         }
 
@@ -336,11 +532,21 @@ extension MentionOverlayController {
                 % model.suggestions.count
         }
 
+        func setPlacement(_ placement: MentionOverlayController.Placement) {
+            self.placement = placement
+        }
+
         func setVisibleRowLimit(_ limit: Int) {
             visibleRowLimit = MentionOverlayController.normalizedVisibleRowLimit(limit)
             model.visibleRowLimit = visibleRowLimit
             resizeWindow(for: max(model.suggestions.count, 1))
         }
+
+        #if DEBUG
+            func clickRowForTesting(_ index: Int) {
+                model.onRowClicked?(index)
+            }
+        #endif
 
         // MARK: – Layout
 

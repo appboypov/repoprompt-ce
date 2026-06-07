@@ -251,7 +251,6 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let before = try String(contentsOf: fileURL, encoding: .utf8)
 
         XCTAssertEqual(store.fileMentionPickerStyle(), .compact)
-        XCTAssertEqual(store.fileMentionPickerStyleRaw(), "compact")
         XCTAssertEqual(store.fileMentionPickerConfiguration(), .compact)
         XCTAssertNil(try fileStore.load().scalarPreferences?.ui?.fileMentionPickerStyle)
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), before)
@@ -294,22 +293,6 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(store.fileMentionPickerStyle(), .compact)
         XCTAssertEqual(store.fileMentionPickerConfiguration(), .compact)
         XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.fileMentionPickerStyle, "wide")
-    }
-
-    func testFileMentionPickerStyleRawSetterPersistsNormalizedValue() throws {
-        let temp = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: temp) }
-        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
-        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
-        let store = try GlobalSettingsStore(
-            defaults: XCTUnwrap(UserDefaults(suiteName: "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)")),
-            fileStore: fileStore
-        )
-
-        store.setFileMentionPickerStyleRaw("wide")
-
-        XCTAssertEqual(store.fileMentionPickerStyle(), .compact)
-        XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.fileMentionPickerStyle, "compact")
     }
 
     private func makeTempDirectory() throws -> URL {

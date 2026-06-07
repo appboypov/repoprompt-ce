@@ -26,6 +26,12 @@ final class FileTagMentionHelper {
     private var isFinalizingCommittedMention = false
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
 
+    init() {
+        overlay.onRowClicked = { [weak self] _, index in
+            self?.selectSuggestion(at: index)
+        }
+    }
+
     func configure(
         textView: ImageAwareTextView,
         enabled: Bool,
@@ -140,6 +146,32 @@ final class FileTagMentionHelper {
         }
         return false
     }
+
+    private func selectSuggestion(at index: Int) {
+        guard suggestions.indices.contains(index) else { return }
+        refreshTask?.cancel()
+        refreshTask = nil
+        suggestionTask?.cancel()
+        suggestionTask = nil
+        suggestionRequestID &+= 1
+        highlightedIndex = index
+    }
+
+    #if DEBUG
+        func setSelectionStateForTesting(
+            suggestions: [MentionSuggestion],
+            highlightedIndex: Int,
+            triggerRange: NSRange
+        ) {
+            self.suggestions = suggestions
+            self.highlightedIndex = highlightedIndex
+            self.triggerRange = triggerRange
+        }
+
+        func clickSuggestionForTesting(at index: Int) {
+            overlay.onRowClicked?(0, index)
+        }
+    #endif
 
     func dismiss() {
         refreshTask?.cancel()
@@ -401,6 +433,12 @@ final class SlashSkillMentionHelper {
     private var suggestionRequestID: UInt64 = 0
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
 
+    init() {
+        overlay.onRowClicked = { [weak self] _, index in
+            self?.selectSuggestion(at: index)
+        }
+    }
+
     func configure(
         textView: ImageAwareTextView,
         enabled: Bool,
@@ -468,6 +506,26 @@ final class SlashSkillMentionHelper {
         }
         return false
     }
+
+    private func selectSuggestion(at index: Int) {
+        guard suggestions.indices.contains(index) else { return }
+        refreshTask?.cancel()
+        refreshTask = nil
+        suggestionTask?.cancel()
+        suggestionTask = nil
+        suggestionRequestID &+= 1
+        highlightedIndex = index
+    }
+
+    #if DEBUG
+        var suggestionsForTesting: [MentionSuggestion] {
+            suggestions
+        }
+
+        func clickSuggestionForTesting(at index: Int) {
+            overlay.onRowClicked?(0, index)
+        }
+    #endif
 
     func dismiss() {
         refreshTask?.cancel()

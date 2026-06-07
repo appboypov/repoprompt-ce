@@ -13,6 +13,7 @@ final class MentionSuggestionService {
     // MARK: – Stored refs
 
     private weak var fileManager: WorkspaceFilesViewModel?
+    private var trackedFileManagerIdentity: ObjectIdentifier?
     private var configuration: FileMentionPickerConfiguration
 
     private var maxResults: Int {
@@ -24,11 +25,17 @@ final class MentionSuggestionService {
         configuration: FileMentionPickerConfiguration = .compact
     ) {
         self.fileManager = fileManager
+        trackedFileManagerIdentity = fileManager.map(ObjectIdentifier.init)
         self.configuration = configuration
     }
 
-    func updateFileManager(_ manager: WorkspaceFilesViewModel?) {
+    @discardableResult
+    func updateFileManager(_ manager: WorkspaceFilesViewModel?) -> Bool {
+        let previousManagerWasDeallocated = fileManager == nil && trackedFileManagerIdentity != nil
+        let changed = previousManagerWasDeallocated || fileManager !== manager
         fileManager = manager
+        trackedFileManagerIdentity = manager.map(ObjectIdentifier.init)
+        return changed
     }
 
     func updateConfiguration(_ configuration: FileMentionPickerConfiguration) {

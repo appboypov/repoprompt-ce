@@ -13,20 +13,23 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     }
 
     @MainActor
-    func testBoundWorktreeSuggestionIncludesBranchOnlyFileWithLogicalPath() async throws {
+    func testExpandedBoundWorktreeSuggestionUsesLogicalPathAndSubtitle() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: true)
         let lookupContext = await makeLookupContext(fixture: fixture)
+        let configuration = FileMentionPickerConfiguration.expanded
         let service = AgentFileTagSuggestionService(
             store: fixture.store,
             searchService: nil,
             selectionCoordinator: nil,
             lookupContextProvider: { lookupContext },
-            maxResults: 5
+            maxResults: configuration.maxResults,
+            showsFileSubtitles: configuration.showsFileSubtitles
         )
 
         let suggestions = await service.suggestions(for: "BranchOnly")
+        let suggestion = try XCTUnwrap(suggestions.first { $0.relativePath == "Sources/BranchOnly.swift" })
 
-        XCTAssertTrue(suggestions.contains { $0.relativePath == "Sources/BranchOnly.swift" }, String(describing: suggestions))
+        XCTAssertEqual(suggestion.subtitle, "Sources")
         XCTAssertFalse(suggestions.contains { $0.relativePath.contains(".worktrees") }, String(describing: suggestions))
         XCTAssertFalse(suggestions.contains { $0.relativePath.contains(fixture.worktreeRoot.path) }, String(describing: suggestions))
     }

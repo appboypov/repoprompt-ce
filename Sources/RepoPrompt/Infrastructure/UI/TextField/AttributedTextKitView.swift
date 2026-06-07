@@ -50,6 +50,7 @@ struct AttributedTextKitView: NSViewRepresentable {
     class Coordinator: NSObject, NSTextViewDelegate {
         private let parent: AttributedTextKitView
         private let undoMgr = UndoManager()
+        private weak var fileManager: WorkspaceFilesViewModel?
         var mentionCoord: MentionCoordinator?
         fileprivate weak var mentionTV: MentionTextView?
 
@@ -76,6 +77,7 @@ struct AttributedTextKitView: NSViewRepresentable {
 
         init(_ parent: AttributedTextKitView) {
             self.parent = parent
+            fileManager = parent.fileManager
             internalText = parent.text
             wasEmpty = parent.text.isEmpty
             undoMgr.levelsOfUndo = 100
@@ -121,11 +123,11 @@ struct AttributedTextKitView: NSViewRepresentable {
         }
 
         /// Called by MentionCoordinator via closure
-        fileprivate func commit(_ suggestion: MentionSuggestion) {
+        func commit(_ suggestion: MentionSuggestion) {
             guard isActive else { return }
             let path = suggestion.relativePath
             tokenCounts[path] = (tokenCounts[path] ?? 0) + 1
-            parent.fileManager?.selectPath(path, kind: suggestion.kind)
+            fileManager?.selectPath(path, kind: suggestion.kind)
         }
 
         /// Called by MentionCoordinator via closure
@@ -135,8 +137,13 @@ struct AttributedTextKitView: NSViewRepresentable {
             let newCount = max((tokenCounts[path] ?? 1) - 1, 0)
             tokenCounts[path] = newCount
             if newCount == 0 {
-                parent.fileManager?.deselectPath(path, kind: payload.kind)
+                fileManager?.deselectPath(path, kind: payload.kind)
             }
+        }
+
+        func updateFileManager(_ manager: WorkspaceFilesViewModel?) {
+            fileManager = manager
+            mentionCoord?.updateFileManager(manager)
         }
 
         /// Syncs the internal token-count table with a freshly computed set of counts.
@@ -314,7 +321,7 @@ struct AttributedTextKitView: NSViewRepresentable {
         guard let textView = nsView.documentView as? NSTextView else { return }
 
         let fileMentionPickerConfiguration = globalSettings.fileMentionPickerConfiguration()
-        context.coordinator.mentionCoord?.updateFileManager(fileManager)
+        context.coordinator.updateFileManager(fileManager)
         context.coordinator.mentionCoord?.updateConfiguration(fileMentionPickerConfiguration)
 
         // Ensure non-contiguous layout stays disabled (fixes Intel Mac issues)
