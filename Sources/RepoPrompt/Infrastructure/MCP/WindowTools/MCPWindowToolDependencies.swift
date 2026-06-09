@@ -170,7 +170,7 @@ struct MCPWindowToolDependencies {
         _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
         _ metadata: MCPServerViewModel.RequestMetadata,
         _ mutated: Bool
-    ) async -> Void
+    ) async -> MCPServerViewModel.MCPSelectionPersistenceVerification?
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupRootScope: WorkspaceLookupRootScope) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?) async throws -> Void
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ maxResults: Int, _ includeUnmappedPaths: Bool, _ projection: WorkspaceRootBindingProjection?) async throws -> ToolResultDTOs.SelectedCodeStructureDTO

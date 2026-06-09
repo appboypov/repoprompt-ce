@@ -313,6 +313,176 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         }
     }
 
+    func testMCPRoutingFailureAfterImmediateStreamReturnCleansBootstrapAndAllowsImmediateRetry() async throws {
+        #if DEBUG
+            let blockedProvider = CodexShapedBlockedRoutingTestProvider()
+            let retryProvider = ImmediateSuccessRoutingTestProvider()
+            let providers = LifecycleTestProviderQueue([blockedProvider, retryProvider])
+            let previousMCPEnabled = await ServerNetworkManager.shared.debugIsEnabledForBootstrapSocketURLOverride()
+
+            await HeadlessAgentConnectionGate.cancelAll()
+            let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let composition = WindowStateCompositionFactory.make(
+                windowID: -75,
+                deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService(),
+                contextBuilderProviderFactory: { _, _, _ in providers.next() }
+            )
+            GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
+            await composition.workspaceManager.awaitInitialized()
+
+            do {
+                let workspaceRoot = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("ContextBuilderMCPRoutingFailureTests-\(UUID().uuidString)")
+                try FileManager.default.createDirectory(
+                    at: workspaceRoot,
+                    withIntermediateDirectories: true
+                )
+                defer {
+                    try? FileManager.default.removeItem(at: workspaceRoot)
+                }
+
+                let workspace = composition.workspaceManager.createWorkspace(
+                    name: "Context Builder MCP routing failure test",
+                    repoPaths: [workspaceRoot.path],
+                    ephemeral: true
+                )
+                await composition.workspaceManager.switchWorkspace(
+                    to: workspace,
+                    saveState: false,
+                    reason: "ContextBuilderRunLifecycleTests.mcpRoutingFailure"
+                )
+
+                let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+                let tabID = try XCTUnwrap(
+                    activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+                )
+                let viewModel = composition.contextBuilderAgentViewModel
+                let savedAgent = viewModel.selectedAgent
+                let savedModelRaw = viewModel.selectedModelRaw
+                viewModel.selectedAgent = .codexExec
+                defer {
+                    viewModel.selectedAgent = savedAgent
+                    viewModel.selectModel(rawModel: savedModelRaw)
+                }
+
+                let firstTeardownCompleted = expectation(description: "failed provider teardown completed")
+                var firstRunID: UUID?
+                viewModel.installRunTestHooks(
+                    ContextBuilderAgentViewModel.RunTestHooks(
+                        beforeProcessingProviderEvent: nil,
+                        providerEventDisposition: nil,
+                        teardownCompleted: { runID in
+                            if runID == firstRunID {
+                                firstTeardownCompleted.fulfill()
+                            }
+                        }
+                    )
+                )
+                defer {
+                    viewModel.installRunTestHooks(nil)
+                }
+
+                let firstToken = try viewModel.beginMCPControlledRun(
+                    forTabID: tabID,
+                    responseType: nil,
+                    planModelName: nil
+                )
+                let firstWaiter = Task { @MainActor in
+                    try await viewModel.runContextBuilderForMCP(
+                        tabID: tabID,
+                        mcpControlToken: firstToken
+                    )
+                }
+
+                await blockedProvider.waitUntilInternalStartupEntered()
+                firstRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
+                let failedRunID = try XCTUnwrap(firstRunID)
+                let routingWaiterRegistered = await waitForRoutingWaiter(runID: failedRunID)
+                XCTAssertTrue(routingWaiterRegistered)
+                await MCPRoutingWaiter.notifyFailed(runID: failedRunID)
+
+                let firstSnapshot = try await firstWaiter.value
+                guard case let .failed(firstError) = firstSnapshot.runState else {
+                    XCTFail("Expected MCP routing failure, got \(firstSnapshot.runState)")
+                    throw MCPRoutingFailureTestError.unexpectedRunState
+                }
+                XCTAssertTrue(firstError.hasPrefix("mcp_routing_failed:"))
+                XCTAssertTrue(firstError.contains("codex-mcp-client"))
+                XCTAssertEqual(firstSnapshot.runID, failedRunID)
+
+                await blockedProvider.waitUntilInternalStartupCancellationObserved()
+                await blockedProvider.waitUntilDisposalStarted()
+                let startupCancellationCount = await blockedProvider.internalStartupCancellationCount()
+                let disposeCallCount = await blockedProvider.disposeCallCount()
+                let internalStartupCompleted = await blockedProvider.internalStartupCompleted()
+                let activeGateID = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+                let waitingGateCount = await HeadlessAgentConnectionGate.shared.debugWaitingCount()
+                let routingWaiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: failedRunID)
+                XCTAssertEqual(startupCancellationCount, 1)
+                XCTAssertEqual(disposeCallCount, 1)
+                XCTAssertFalse(internalStartupCompleted)
+                XCTAssertNil(viewModel.activeRunIDForTesting(tabID: tabID))
+                XCTAssertTrue(viewModel.isRunTeardownPendingForTesting(runID: failedRunID))
+                XCTAssertNil(activeGateID)
+                XCTAssertEqual(waitingGateCount, 0)
+                XCTAssertEqual(routingWaiterCount, 0)
+                if let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
+                    let pendingPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+                        for: clientName
+                    )
+                    XCTAssertFalse(pendingPolicies.contains { $0.runID == failedRunID })
+                }
+
+                let retryToken = try viewModel.beginMCPControlledRun(
+                    forTabID: tabID,
+                    responseType: nil,
+                    planModelName: nil
+                )
+                let retrySnapshot = try await viewModel.runContextBuilderForMCP(
+                    tabID: tabID,
+                    mcpControlToken: retryToken
+                )
+
+                XCTAssertEqual(retrySnapshot.runState, .completed)
+                XCTAssertEqual(retrySnapshot.agentOutput, "retry-success")
+                XCTAssertNotEqual(retrySnapshot.runID, failedRunID)
+                XCTAssertTrue(viewModel.isRunTeardownPendingForTesting(runID: failedRunID))
+                let disposeCallCountAfterRetry = await blockedProvider.disposeCallCount()
+                XCTAssertEqual(disposeCallCountAfterRetry, 1)
+
+                await blockedProvider.releaseDisposal()
+                await blockedProvider.waitUntilDisposalFinished()
+                await fulfillment(of: [firstTeardownCompleted], timeout: 1)
+                XCTAssertFalse(viewModel.isRunTeardownPendingForTesting(runID: failedRunID))
+
+                await composition.mcpServer.stopServer()
+                await composition.mcpServer.shutdownListener()
+                await ServerNetworkManager.shared.setEnabled(previousMCPEnabled)
+            } catch {
+                await blockedProvider.releaseInternalStartup()
+                await blockedProvider.releaseDisposal()
+                await composition.mcpServer.stopServer()
+                await composition.mcpServer.shutdownListener()
+                await ServerNetworkManager.shared.setEnabled(previousMCPEnabled)
+                throw error
+            }
+        #else
+            throw XCTSkip("MCP routing failure lifecycle inspection is DEBUG-only.")
+        #endif
+    }
+
+    private func waitForRoutingWaiter(runID: UUID) async -> Bool {
+        for _ in 0 ..< 1000 {
+            if await MCPRoutingWaiter.debugContinuationCount(runID: runID) == 1 {
+                return true
+            }
+            await Task.yield()
+        }
+        return false
+    }
+
     private func makeRecord(
         tabID: UUID,
         session: ContextBuilderAgentViewModel.TabSession,
@@ -489,4 +659,143 @@ private actor LifecycleTestGate {
             waiter.resume()
         }
     }
+}
+
+private final class CodexShapedBlockedRoutingTestProvider: HeadlessAgentProvider {
+    private let internalStartupEntered = LifecycleTestGate()
+    private let internalStartupBlock = LifecycleTestGate()
+    private let internalStartupCancellationObserved = LifecycleTestGate()
+    private let disposalStarted = LifecycleTestGate()
+    private let disposalBlock = LifecycleTestGate()
+    private let disposalFinished = LifecycleTestGate()
+    private let state = CodexShapedBlockedRoutingTestState()
+    private var internalStartupTask: Task<Void, Never>?
+    private var streamContinuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation?
+
+    func streamAgentMessage(
+        _ message: AgentMessage,
+        runID: UUID?
+    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        _ = message
+        _ = runID
+        return AsyncThrowingStream { continuation in
+            streamContinuation = continuation
+            internalStartupTask = Task { [weak self] in
+                guard let self else { return }
+                await withTaskCancellationHandler {
+                    await internalStartupEntered.arrive()
+                    await internalStartupBlock.arriveAndWait()
+                    guard !Task.isCancelled else { return }
+                    await state.recordInternalStartupCompleted()
+                    continuation.finish()
+                } onCancel: {
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await state.recordInternalStartupCancellation()
+                        await internalStartupCancellationObserved.arrive()
+                        continuation.finish()
+                    }
+                }
+            }
+            continuation.onTermination = { [weak self] _ in
+                self?.internalStartupTask?.cancel()
+            }
+        }
+    }
+
+    func dispose() async {
+        await state.recordDisposeCall()
+        internalStartupTask?.cancel()
+        await internalStartupCancellationObserved.waitUntilArrived()
+        await internalStartupBlock.release()
+        await disposalStarted.arrive()
+        await disposalBlock.arriveAndWait()
+        streamContinuation?.finish()
+        streamContinuation = nil
+        await internalStartupTask?.value
+        internalStartupTask = nil
+        await state.recordDisposalFinished()
+        await disposalFinished.arrive()
+    }
+
+    func waitUntilInternalStartupEntered() async {
+        await internalStartupEntered.waitUntilArrived()
+    }
+
+    func waitUntilInternalStartupCancellationObserved() async {
+        await internalStartupCancellationObserved.waitUntilArrived()
+    }
+
+    func waitUntilDisposalStarted() async {
+        await disposalStarted.waitUntilArrived()
+    }
+
+    func waitUntilDisposalFinished() async {
+        await disposalFinished.waitUntilArrived()
+    }
+
+    func releaseInternalStartup() async {
+        internalStartupTask?.cancel()
+        await internalStartupBlock.release()
+    }
+
+    func releaseDisposal() async {
+        await disposalBlock.release()
+    }
+
+    func internalStartupCancellationCount() async -> Int {
+        await state.internalStartupCancellationCount
+    }
+
+    func internalStartupCompleted() async -> Bool {
+        await state.internalStartupCompleted
+    }
+
+    func disposeCallCount() async -> Int {
+        await state.disposeCallCount
+    }
+}
+
+private final class ImmediateSuccessRoutingTestProvider: HeadlessAgentProvider {
+    func streamAgentMessage(
+        _ message: AgentMessage,
+        runID: UUID?
+    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        _ = message
+        guard let runID else { throw CancellationError() }
+        await MCPRoutingWaiter.notifyRouted(runID: runID)
+        return AsyncThrowingStream { continuation in
+            continuation.yield(AIStreamResult(type: "content", text: "retry-success"))
+            continuation.finish()
+        }
+    }
+
+    func dispose() async {}
+}
+
+private actor CodexShapedBlockedRoutingTestState {
+    private(set) var internalStartupCancellationCount = 0
+    private(set) var internalStartupCompleted = false
+    private(set) var disposeCallCount = 0
+    private(set) var disposalFinished = false
+
+    func recordInternalStartupCancellation() {
+        internalStartupCancellationCount += 1
+    }
+
+    func recordInternalStartupCompleted() {
+        internalStartupCompleted = true
+    }
+
+    func recordDisposeCall() {
+        disposeCallCount += 1
+    }
+
+    func recordDisposalFinished() {
+        disposalFinished = true
+    }
+}
+
+private enum MCPRoutingFailureTestError: Error {
+    case unexpectedRunState
 }

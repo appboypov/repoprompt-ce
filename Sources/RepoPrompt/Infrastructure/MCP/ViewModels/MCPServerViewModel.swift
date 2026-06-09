@@ -753,8 +753,8 @@ final class MCPServerViewModel: ObservableObject {
             return await computeSelectionSlicesVirtual(base: base, entries: entries, mode: mode, lookupRootScope: lookupRootScope)
         },
         persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated in
-            guard let self else { return }
-            await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
+            guard let self else { return nil }
+            return await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
         },
         makeSelectionHintError: { [weak self] paths, operation, lookupRootScope in
             guard let self else { return "Window deallocated while resolving selection inputs." }
@@ -2816,12 +2816,19 @@ final class MCPServerViewModel: ObservableObject {
                 return
             }
             resolvedContext.snapshot.selection = clearedSelection
-            await EditFlowPerf.measure(
+            let verification = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.ReadFile.AutoSelect.persistence,
                 EditFlowPerf.Dimensions(outcome: "attempted")
             ) {
                 await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
             }
+            _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                verification,
+                requested: clearedSelection,
+                tabID: resolvedContext.snapshot.tabID,
+                operation: "read_file auto-selection",
+                recovery: "Retry the read or manage_selection for the same context_id before relying on the selection."
+            )
             #if DEBUG || EDIT_FLOW_PERF
                 fullFlowOutcome = "changed"
             #endif
@@ -3248,7 +3255,14 @@ final class MCPServerViewModel: ObservableObject {
         )
         if computed.mutated {
             resolvedContext.snapshot.selection = computed.selection
-            await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                verification,
+                requested: computed.selection,
+                tabID: resolvedContext.snapshot.tabID,
+                operation: "selection slice update",
+                recovery: "Retry the selection slice mutation for the same context_id before continuing."
+            )
         }
         return computed.result
     }
@@ -3804,7 +3818,14 @@ final class MCPServerViewModel: ObservableObject {
             )
             guard addResult.selection != resolvedContext.snapshot.selection else { return }
             resolvedContext.snapshot.selection = addResult.selection
-            await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                verification,
+                requested: addResult.selection,
+                tabID: resolvedContext.snapshot.tabID,
+                operation: "file_actions create selection update",
+                recovery: "The file was created, but its selection was not confirmed; retry manage_selection for the same context_id."
+            )
         }
     }
 
