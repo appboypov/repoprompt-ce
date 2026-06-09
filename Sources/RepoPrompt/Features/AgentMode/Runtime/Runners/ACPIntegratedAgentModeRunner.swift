@@ -166,7 +166,28 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         }
-        let support = await provider.support(for: freshRunRequest)
+        let support: ACPSupportResult
+        do {
+            support = try await provider.support(for: freshRunRequest)
+        } catch is CancellationError {
+            await cancelBeforeProviderSend(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID
+            )
+            return
+        } catch {
+            await failBeforeProviderSend(
+                tabID: tabID,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID,
+                errorText: "ACP support preflight failed: \(error.localizedDescription)"
+            )
+            return
+        }
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
         guard support == .supported else {
             await failBeforeProviderSend(
@@ -358,6 +379,36 @@ final class ACPIntegratedAgentModeRunner {
             terminalState: .failed,
             source: "acp.startupFailure",
             errorText: errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            prepareProviderState: {
+                session.acpController = nil
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                return nil
+            }
+        ))
+    }
+
+    private func cancelBeforeProviderSend(
+        session: AgentModeViewModel.TabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        attachmentReservationID: UUID?
+    ) async {
+        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
+              let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID
+        else { return }
+        hooks.recordPendingHandoffSendOutcome(session, false)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .cancelled,
+            source: "acp.startupCancelled",
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,

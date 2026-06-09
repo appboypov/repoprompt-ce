@@ -4,7 +4,6 @@ struct CursorACPAgentProvider: ACPAgentProvider {
     private let config: CursorAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: CursorACPLaunchResolver
-    private let approvalEnvironmentProvider: @Sendable () -> [String: String]
 
     #if DEBUG
         var test_config: CursorAgentConfig {
@@ -15,23 +14,19 @@ struct CursorACPAgentProvider: ACPAgentProvider {
     init(
         config: CursorAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: CursorACPLaunchResolver = CursorACPLaunchResolver(),
-        approvalEnvironmentProvider: @escaping @Sendable () -> [String: String] = {
-            ProcessInfo.processInfo.environment
-        }
+        launchResolver: CursorACPLaunchResolver = CursorACPLaunchResolver()
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
-        self.approvalEnvironmentProvider = approvalEnvironmentProvider
     }
 
     var providerID: ACPProviderID {
         .cursor
     }
 
-    func support(for _: ACPRunRequest) async -> ACPSupportResult {
-        await launchResolver.probeSupport(for: config)
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        try await launchResolver.probeSupport(for: config)
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
@@ -40,10 +35,9 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         var environment: [String: String] = [:]
         var cleanupArtifact: ACPLaunchCleanupArtifact?
         if config.includeRepoPromptMCPServer {
-            let approvalEnvironment = approvalEnvironmentProvider()
             let cursorDataDirectory = CursorIntegrationConfiguration.cursorDataDirectoryURL(
                 workingDirectory: workingDirectory,
-                environment: approvalEnvironment
+                environment: resolvedLaunch.environment
             )
             environment["CURSOR_DATA_DIR"] = cursorDataDirectory.path
             cleanupArtifact = try CursorIntegrationConfiguration.prepareProjectMCPApproval(

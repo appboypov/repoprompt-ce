@@ -186,41 +186,12 @@ enum CursorIntegrationConfiguration {
         case .none, .deferred:
             return
         case let .final(state):
-            defer {
-                leaseStore.completeFinalCleanup(leaseID: leaseID)
-            }
             do {
-                let currentData: Data?
-                if fm.fileExists(atPath: state.approvalURL.path) {
-                    do {
-                        currentData = try Data(contentsOf: state.approvalURL)
-                    } catch {
-                        #if DEBUG
-                            print("[CursorIntegrationConfiguration] Cleanup read failed for \(state.approvalURL.path): \(error.localizedDescription)")
-                        #endif
-                        return
-                    }
-                } else {
-                    currentData = nil
-                }
-
-                guard currentData == state.latestWrittenData else {
-                    try cleanupDivergentApprovalFile(
-                        currentData: currentData,
-                        state: state,
-                        fileManager: fm
-                    )
-                    return
-                }
-
-                if let previousData = state.originalPreviousData {
-                    try previousData.write(to: state.approvalURL, options: .atomic)
-                } else if fm.fileExists(atPath: state.approvalURL.path) {
-                    try fm.removeItem(at: state.approvalURL)
-                }
-
-                removeDirectoryIfOwnedAndEmpty(state: state, fileManager: fm)
+                try cleanupInsertedApprovals(state: state, fileManager: fm)
+                leaseStore.completeFinalCleanup(leaseID: leaseID)
             } catch {
+                // Keep the final lease registered so cleanup can be retried after a transient
+                // read/parse/write failure instead of permanently orphaning our approval IDs.
                 #if DEBUG
                     print("[CursorIntegrationConfiguration] Cleanup failed for \(state.approvalURL.path): \(error.localizedDescription)")
                 #endif
@@ -228,20 +199,21 @@ enum CursorIntegrationConfiguration {
         }
     }
 
-    private static func cleanupDivergentApprovalFile(
-        currentData: Data?,
+    private static func cleanupInsertedApprovals(
         state: CursorProjectMCPApprovalLeaseStore.PathLeaseState,
         fileManager: FileManager
     ) throws {
-        guard !state.insertedApprovalIDs.isEmpty,
-              let currentData,
-              let currentApprovals = try? existingApprovals(
-                  from: currentData,
-                  approvalURL: state.approvalURL
-              )
-        else {
+        guard !state.insertedApprovalIDs.isEmpty else { return }
+        guard fileManager.fileExists(atPath: state.approvalURL.path) else {
+            removeDirectoryIfOwnedAndEmpty(state: state, fileManager: fileManager)
             return
         }
+
+        let currentData = try Data(contentsOf: state.approvalURL)
+        let currentApprovals = try existingApprovals(
+            from: currentData,
+            approvalURL: state.approvalURL
+        )
         let retainedApprovals = currentApprovals.filter {
             !state.insertedApprovalIDs.contains($0)
         }
@@ -413,7 +385,6 @@ private final class CursorProjectMCPApprovalLeaseStore: @unchecked Sendable {
         let originalPreviousData: Data?
         let originalCreatedDirectory: Bool
         var activeLeaseIDs: Set<UUID>
-        var latestWrittenData: Data
         var insertedApprovalIDs: Set<String>
     }
 
@@ -434,7 +405,6 @@ private final class CursorProjectMCPApprovalLeaseStore: @unchecked Sendable {
         approvalPathByLeaseID[lease.id] = key
         if var state = stateByApprovalPath[key] {
             state.activeLeaseIDs.insert(lease.id)
-            state.latestWrittenData = lease.writtenData
             state.insertedApprovalIDs.formUnion(lease.insertedApprovalIDs)
             stateByApprovalPath[key] = state
         } else {
@@ -444,7 +414,6 @@ private final class CursorProjectMCPApprovalLeaseStore: @unchecked Sendable {
                 originalPreviousData: lease.previousData,
                 originalCreatedDirectory: lease.createdDirectory,
                 activeLeaseIDs: [lease.id],
-                latestWrittenData: lease.writtenData,
                 insertedApprovalIDs: lease.insertedApprovalIDs
             )
         }

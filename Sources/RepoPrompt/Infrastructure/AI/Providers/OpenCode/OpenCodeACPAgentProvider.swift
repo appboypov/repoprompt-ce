@@ -29,8 +29,8 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         .openCode
     }
 
-    func support(for _: ACPRunRequest) async -> ACPSupportResult {
-        await launchResolver.probeSupport(for: config)
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        try await launchResolver.probeSupport(for: config)
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {

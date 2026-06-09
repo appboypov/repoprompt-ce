@@ -38,7 +38,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             includeRepoPromptMCPServer: false
         )
 
-        let support = await resolver.probeSupport(for: config)
+        let support = try await resolver.probeSupport(for: config)
         let provider = CursorACPAgentProvider(config: config, launchResolver: resolver)
         let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
         let probedPath = try String(contentsOf: probePathRecord, encoding: .utf8)
@@ -71,24 +71,24 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let originalData = Data(#"["existing-approval"]"#.utf8)
         try originalData.write(to: approvalURL)
 
+        let capturedEnvironment = [
+            "CURSOR_DATA_DIR": cursorDataDirectory.path,
+            "HOME": "/ignored-by-explicit-cursor-data-dir",
+            "PATH": executableDirectory.path
+        ]
         let provider = CursorACPAgentProvider(
             config: CursorAgentConfig(
                 commandName: executable.path,
                 additionalPathHints: []
             ),
             repoPromptMCPConfiguration: mcpConfiguration,
-            launchResolver: CursorACPLaunchResolver(),
-            approvalEnvironmentProvider: {
-                [
-                    "CURSOR_DATA_DIR": cursorDataDirectory.path,
-                    "HOME": "/ignored-by-explicit-cursor-data-dir"
-                ]
-            }
+            launchResolver: CursorACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
         )
+        let request = makeRunRequest(workspacePath: workspace.path)
 
-        let launch = try provider.makeLaunchConfiguration(
-            for: makeRunRequest(workspacePath: workspace.path)
-        )
+        let support = try await provider.support(for: request)
+        XCTAssertEqual(support, .supported)
+        let launch = try provider.makeLaunchConfiguration(for: request)
         let artifact = try XCTUnwrap(launch.cleanupArtifact)
         addTeardownBlock {
             await provider.cleanupLaunchArtifacts(for: launch)
@@ -119,7 +119,10 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
 
         await provider.cleanupLaunchArtifacts(for: launch)
-        XCTAssertEqual(try Data(contentsOf: approvalURL), originalData)
+        let retainedApprovals = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
+        )
+        XCTAssertEqual(retainedApprovals, ["existing-approval"])
     }
 
     func testApprovalIdentifierMatchesCursorCLIHashContract() throws {
@@ -263,7 +266,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(retainedApprovals, ["existing-approval", "cursor-added-approval"])
     }
 
-    func testConcurrentApprovalLeasesRestoreOriginalDataAfterFinalCleanup() throws {
+    func testConcurrentApprovalLeasesRemoveOnlyRepoPromptInsertionsAfterFinalCleanup() throws {
         for cleanupFirstLeaseFirst in [true, false] {
             let workspace = try makeTemporaryDirectory()
             let cursorDataDirectory = try makeTemporaryDirectory()
@@ -285,6 +288,14 @@ final class CursorACPLaunchResolverTests: XCTestCase {
                     repoPromptMCPConfiguration: .init(command: "/tmp/repoprompt-mcp-one")
                 )
             )
+            let afterFirstLease = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
+            )
+            try JSONSerialization.data(
+                withJSONObject: afterFirstLease + ["cursor-added-between-leases"],
+                options: [.prettyPrinted]
+            ).write(to: approvalURL, options: .atomic)
+
             let second = try XCTUnwrap(
                 CursorIntegrationConfiguration.prepareProjectMCPApproval(
                     workingDirectory: workspace.path,
@@ -303,8 +314,53 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             XCTAssertNotEqual(try Data(contentsOf: approvalURL), originalData)
 
             CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: finalCleanup.id)
-            XCTAssertEqual(try Data(contentsOf: approvalURL), originalData)
+            let retainedApprovals = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
+            )
+            XCTAssertEqual(retainedApprovals, ["existing-approval", "cursor-added-between-leases"])
         }
+    }
+
+    func testFailedFinalApprovalCleanupRetainsRetryBookkeeping() throws {
+        let workspace = try makeTemporaryDirectory()
+        let cursorDataDirectory = try makeTemporaryDirectory()
+        let configuration = RepoPromptMCPServerConfiguration(command: "/tmp/repoprompt-mcp")
+        let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
+            workingDirectory: workspace.path,
+            cursorDataDirectory: cursorDataDirectory
+        )
+        let artifact = try XCTUnwrap(
+            CursorIntegrationConfiguration.prepareProjectMCPApproval(
+                workingDirectory: workspace.path,
+                cursorDataDirectory: cursorDataDirectory,
+                repoPromptMCPConfiguration: configuration
+            )
+        )
+        let temporaryApproval = try CursorIntegrationConfiguration.approvalIdentifier(
+            projectRoot: CursorIntegrationConfiguration.projectRootURL(
+                workingDirectory: workspace.path
+            ).path,
+            repoPromptMCPConfiguration: configuration
+        )
+        defer {
+            CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
+        }
+
+        try FileManager.default.removeItem(at: approvalURL)
+        try FileManager.default.createDirectory(at: approvalURL, withIntermediateDirectories: false)
+        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
+
+        try FileManager.default.removeItem(at: approvalURL)
+        try JSONSerialization.data(
+            withJSONObject: [temporaryApproval, "cursor-added-after-failure"],
+            options: [.prettyPrinted]
+        ).write(to: approvalURL, options: .atomic)
+        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
+
+        let retainedApprovals = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
+        )
+        XCTAssertEqual(retainedApprovals, ["cursor-added-after-failure"])
     }
 
     func testRepeatedProbeRefreshesCurrentEnvironmentBeforeSpawn() async throws {
@@ -321,7 +377,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         })
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        let firstSupport = await resolver.probeSupport(for: config)
+        let firstSupport = try await resolver.probeSupport(for: config)
         let firstLaunch = try resolver.resolvedLaunch(for: config)
         XCTAssertEqual(firstSupport, .supported)
         XCTAssertEqual(firstLaunch.command, firstExecutable.resolvingSymlinksInPath().path)
@@ -330,7 +386,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             "PATH": secondDirectory.path,
             "SHELL": "/bin/false"
         ])
-        let secondSupport = await resolver.probeSupport(for: config)
+        let secondSupport = try await resolver.probeSupport(for: config)
         let secondLaunch = try resolver.resolvedLaunch(for: config)
         XCTAssertEqual(secondSupport, .supported)
         XCTAssertEqual(secondLaunch.command, secondExecutable.resolvingSymlinksInPath().path)
@@ -427,7 +483,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = CursorACPLaunchResolver()
         let config = CursorAgentConfig(commandName: executable.path, additionalPathHints: [])
 
-        let support = await resolver.probeSupport(for: config)
+        let support = try await resolver.probeSupport(for: config)
         XCTAssertEqual(support, .supported)
         try FileManager.default.removeItem(at: executable)
         _ = try makeExecutable(named: "cursor-agent", in: directory, output: "replacement ACP")
@@ -460,12 +516,57 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         _ = try makeExecutable(named: "cursor", in: directory, marker: marker)
         let config = CursorAgentConfig(commandName: "cursor", additionalPathHints: [directory.path])
 
-        let support = await CursorACPLaunchResolver().probeSupport(for: config)
+        let support = try await CursorACPLaunchResolver().probeSupport(for: config)
 
         guard case let .unsupported(reason) = support else {
             return XCTFail("Expected unsupported result")
         }
         XCTAssertTrue(reason.contains("Refusing unsafe Cursor ACP command"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testCancelledSupportProbePropagatesCancellationAndLeavesNoBareCommandCache() async throws {
+        let directory = try makeTemporaryDirectory()
+        let marker = directory.appendingPathComponent("probe-started")
+        _ = try makeExecutable(named: "cursor-agent", in: directory, marker: marker, sleepSeconds: 30)
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = directory.path
+        environment["SHELL"] = "/bin/false"
+        let capturedEnvironment = environment
+        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
+        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
+
+        let probe = Task { try await resolver.probeSupport(for: config) }
+        let didStartProbe = await waitUntilFileExists(marker)
+        XCTAssertTrue(didStartProbe)
+        probe.cancel()
+        do {
+            _ = try await probe.value
+            XCTFail("Expected support probe cancellation")
+        } catch is CancellationError {
+            // Expected: cancellation is not converted into an unsupported result.
+        }
+
+        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
+            guard case CursorACPLaunchResolutionError.environmentDiscoveryRequired = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testWorldWritableExecutableDirectoryIsRejectedWithoutExecution() async throws {
+        let directory = try makeTemporaryDirectory()
+        let marker = directory.appendingPathComponent("probe-ran")
+        let executable = try makeExecutable(named: "cursor-agent", in: directory, marker: marker)
+        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: directory.path)
+
+        let support = try await CursorACPLaunchResolver().probeSupport(
+            for: CursorAgentConfig(commandName: executable.path, additionalPathHints: [])
+        )
+
+        guard case .unsupported = support else {
+            return XCTFail("Expected unsafe launch path to be unsupported")
+        }
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
@@ -479,7 +580,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = CursorACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        guard case .unsupported = await resolver.probeSupport(for: config) else {
+        guard case .unsupported = try await resolver.probeSupport(for: config) else {
             return XCTFail("Expected failed support probe")
         }
         XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
@@ -490,7 +591,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
 
         try FileManager.default.removeItem(at: executable)
         let replacement = try makeExecutable(named: "cursor-agent", in: directory)
-        let replacementSupport = await resolver.probeSupport(for: config)
+        let replacementSupport = try await resolver.probeSupport(for: config)
         XCTAssertEqual(replacementSupport, .supported)
         XCTAssertEqual(
             try resolver.resolvedLaunch(for: config).command,
@@ -514,7 +615,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             additionalPathHints: [directory.path]
         )
 
-        let support = await CursorACPLaunchResolver().probeSupport(for: config)
+        let support = try await CursorACPLaunchResolver().probeSupport(for: config)
 
         guard case .unsupported = support else {
             return XCTFail("Expected unsupported result")
@@ -646,18 +747,31 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         in directory: URL,
         marker: URL? = nil,
         output: String = "Cursor Agent ACP support",
-        exitStatus: Int32 = 0
+        exitStatus: Int32 = 0,
+        sleepSeconds: Int? = nil
     ) throws -> URL {
         let executable = directory.appendingPathComponent(name)
         var lines = ["#!/bin/sh"]
         if let marker {
             lines.append("printf '%s' \"$0\" > '\(marker.path)'")
         }
+        if let sleepSeconds {
+            lines.append("exec /bin/sleep \(sleepSeconds)")
+        }
         lines.append("printf '%s\\n' '\(output)'")
         lines.append("exit \(exitStatus)")
         try lines.joined(separator: "\n").write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         return executable
+    }
+
+    private func waitUntilFileExists(_ url: URL, timeout: TimeInterval = 2) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if FileManager.default.fileExists(atPath: url.path) { return true }
+            await Task.yield()
+        } while Date() < deadline
+        return false
     }
 }
 

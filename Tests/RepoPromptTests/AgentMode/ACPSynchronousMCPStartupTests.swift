@@ -36,6 +36,9 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
             runRequest: request,
             requestTimeouts: .init(bootstrapSeconds: 2)
         )
+        addTeardownBlock {
+            await controller.shutdown()
+        }
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -73,6 +76,9 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
             runRequest: request,
             requestTimeouts: .init(bootstrapSeconds: 2)
         )
+        addTeardownBlock {
+            await controller.shutdown()
+        }
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -128,6 +134,9 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
             runRequest: request,
             requestTimeouts: .init(bootstrapSeconds: 2)
         )
+        addTeardownBlock {
+            await controller.shutdown()
+        }
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()

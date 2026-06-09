@@ -944,6 +944,9 @@ actor ServerNetworkManager {
         private var debugShouldSuspendNextPendingPolicyRouteInstallation = false
         private var debugPendingPolicyRouteInstallationIsSuspended = false
         private var debugPendingPolicyRouteInstallationResumeWaiters: [CheckedContinuation<Void, Never>] = []
+        private var debugShouldSuspendNextPendingPolicyCommit = false
+        private var debugPendingPolicyCommitIsSuspended = false
+        private var debugPendingPolicyCommitResumeWaiters: [CheckedContinuation<Void, Never>] = []
     #endif
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
     private var expectedAgentPIDsByRunID: [UUID: Set<pid_t>] = [:]
@@ -1685,7 +1688,8 @@ actor ServerNetworkManager {
         _ connectionID: UUID,
         runID: UUID,
         windowID explicitWindowID: Int? = nil,
-        persistWindowBinding: Bool = true
+        persistWindowBinding: Bool = true,
+        signalRouting: Bool = true
     ) async -> Bool {
         let resolvedWindowID: Int? = if let explicitWindowID {
             explicitWindowID
@@ -1710,6 +1714,9 @@ actor ServerNetworkManager {
             return mappedRun == runID && mappedConnection == connectionID
         }
         if alreadyMapped {
+            if signalRouting {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
             if persistWindowBinding, connectionWindowMap[connectionID] != windowID {
                 setConnectionWindowMapping(connectionID, windowID: windowID)
             }
@@ -1730,7 +1737,8 @@ actor ServerNetworkManager {
             let didRegister = window.mcpServer.registerRunIDMapping(
                 connectionID: connectionID,
                 runID: runID,
-                windowID: windowID
+                windowID: windowID,
+                signalRouting: signalRouting
             )
             if didRegister {
                 connectionLog("mapConnectionToRunID: mapped connection \(connectionID) to runID \(runID) in window \(windowID)")
@@ -3426,7 +3434,8 @@ actor ServerNetworkManager {
                             clientName: clientInfo.name,
                             connectionID: connectionID,
                             clientPid: clientPid,
-                            bootstrapClientName: bootstrapClientName
+                            bootstrapClientName: bootstrapClientName,
+                            expectedLifecycleGeneration: expectedLifecycleGeneration
                         )
                         guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
                         if case let .rejected(runID, reason) = policyOutcome {
@@ -4827,6 +4836,26 @@ actor ServerNetworkManager {
             waiters.forEach { $0.resume() }
         }
 
+        func debugInvalidatePendingPolicyApplication(connectionID: UUID) {
+            pendingConnections.removeValue(forKey: connectionID)
+        }
+
+        func debugSuspendNextPendingPolicyCommit() {
+            debugShouldSuspendNextPendingPolicyCommit = true
+        }
+
+        func debugIsPendingPolicyCommitSuspended() -> Bool {
+            debugPendingPolicyCommitIsSuspended
+        }
+
+        func debugResumePendingPolicyCommit() {
+            debugShouldSuspendNextPendingPolicyCommit = false
+            debugPendingPolicyCommitIsSuspended = false
+            let waiters = debugPendingPolicyCommitResumeWaiters
+            debugPendingPolicyCommitResumeWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
         private func debugSuspendPendingPolicyRouteInstallationIfNeeded() async {
             guard debugShouldSuspendNextPendingPolicyRouteInstallation else { return }
             debugShouldSuspendNextPendingPolicyRouteInstallation = false
@@ -4835,6 +4864,16 @@ actor ServerNetworkManager {
                 debugPendingPolicyRouteInstallationResumeWaiters.append(continuation)
             }
             debugPendingPolicyRouteInstallationIsSuspended = false
+        }
+
+        private func debugSuspendPendingPolicyCommitIfNeeded() async {
+            guard debugShouldSuspendNextPendingPolicyCommit else { return }
+            debugShouldSuspendNextPendingPolicyCommit = false
+            debugPendingPolicyCommitIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugPendingPolicyCommitResumeWaiters.append(continuation)
+            }
+            debugPendingPolicyCommitIsSuspended = false
         }
 
         func debugPendingPolicySnapshot(for clientName: String) -> [(windowID: Int, tabID: UUID?, runID: UUID?, oneShot: Bool, purpose: MCPRunPurpose)] {
@@ -6795,7 +6834,8 @@ actor ServerNetworkManager {
         clientPid: Int? = nil,
         bootstrapClientName: String? = nil,
         pidGateTimeout: TimeInterval = 2.0,
-        requireRunRouting: Bool = true
+        requireRunRouting: Bool = true,
+        expectedLifecycleGeneration: UInt64? = nil
     ) async -> PendingPolicyApplicationOutcome {
         if let reservedEntry = oldestReservedPendingPolicyEntry(for: clientName),
            canConsumePendingPolicy(reservedEntry.policy, clientName: clientName, clientPid: clientPid)
@@ -7027,6 +7067,28 @@ actor ServerNetworkManager {
             await debugSuspendPendingPolicyRouteInstallationIfNeeded()
         #endif
 
+        guard isPendingPolicyApplicationCurrent(
+            connectionID: connectionID,
+            clientName: clientName,
+            expectedLifecycleGeneration: expectedLifecycleGeneration
+        ) else {
+            if policy.oneShot {
+                _ = rollbackOneShotPendingPolicyReservation(
+                    id: policy.id,
+                    key: matchedQueueEntry.key,
+                    connectionID: connectionID
+                )
+            }
+            await rollbackPendingPolicyApplication(
+                policy,
+                clientName: clientName,
+                connectionID: connectionID,
+                restorePoint: restorePoint,
+                signalRoutingFailure: false
+            )
+            return .rejected(runID: policy.runID, reason: "stale_connection")
+        }
+
         if requireRunRouting, let runID = policy.runID {
             let routed: Bool
             if let tabID = policy.tabID {
@@ -7036,13 +7098,15 @@ actor ServerNetworkManager {
                     clientName: clientName,
                     windowID: policy.windowID,
                     tabID: tabID,
-                    runID: runID
+                    runID: runID,
+                    signalRouting: false
                 )
             } else {
                 routed = await mapConnectionToRunID(
                     connectionID,
                     runID: runID,
-                    windowID: policy.windowID
+                    windowID: policy.windowID,
+                    signalRouting: false
                 )
             }
             #if DEBUG
@@ -7074,6 +7138,32 @@ actor ServerNetworkManager {
                     reason: reservationRolledBack ? "route_mapping_failed" : "policy_removed"
                 )
             }
+
+            #if DEBUG
+                await debugSuspendPendingPolicyCommitIfNeeded()
+            #endif
+
+            guard isPendingPolicyApplicationCurrent(
+                connectionID: connectionID,
+                clientName: clientName,
+                expectedLifecycleGeneration: expectedLifecycleGeneration
+            ) else {
+                if policy.oneShot {
+                    _ = rollbackOneShotPendingPolicyReservation(
+                        id: policy.id,
+                        key: matchedQueueEntry.key,
+                        connectionID: connectionID
+                    )
+                }
+                await rollbackPendingPolicyApplication(
+                    policy,
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    restorePoint: restorePoint,
+                    signalRoutingFailure: false
+                )
+                return .rejected(runID: runID, reason: "stale_connection")
+            }
         }
 
         if policy.oneShot,
@@ -7090,6 +7180,10 @@ actor ServerNetworkManager {
                 restorePoint: restorePoint
             )
             return .rejected(runID: policy.runID, reason: "policy_removed")
+        }
+
+        if requireRunRouting, let runID = policy.runID {
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
         }
 
         let grantDescription = Self.describeGrantedTools(restricted: policy.restrictedTools)
@@ -7155,11 +7249,23 @@ actor ServerNetworkManager {
         return .applied(runID: policy.runID)
     }
 
+    private func isPendingPolicyApplicationCurrent(
+        connectionID: UUID,
+        clientName: String,
+        expectedLifecycleGeneration: UInt64?
+    ) -> Bool {
+        if let expectedLifecycleGeneration {
+            return isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration)
+        }
+        return pendingConnections[connectionID] == clientName
+    }
+
     private func rollbackPendingPolicyApplication(
         _ policy: ClientConnectionPolicy,
         clientName: String,
         connectionID: UUID,
-        restorePoint: PendingPolicyRestorePoint
+        restorePoint: PendingPolicyRestorePoint,
+        signalRoutingFailure: Bool = true
     ) async {
         if let runID = policy.runID {
             await MainActor.run {
@@ -7170,7 +7276,11 @@ actor ServerNetworkManager {
                     windowID: policy.windowID,
                     runID: runID
                 )
-                window.mcpServer.cleanupRunIDMapping(runID: runID, connectionID: connectionID)
+                window.mcpServer.cleanupRunIDMapping(
+                    runID: runID,
+                    connectionID: connectionID,
+                    signalRoutingFailure: signalRoutingFailure
+                )
             }
             restorePendingPolicyState(
                 restorePoint,
@@ -7243,7 +7353,8 @@ actor ServerNetworkManager {
         clientName: String,
         windowID: Int,
         tabID: UUID,
-        runID: UUID
+        runID: UUID,
+        signalRouting: Bool = true
     ) async -> Bool {
         let resolved = await MainActor.run { () -> (workspaceID: UUID, snapshot: ComposeTabState, routed: Bool)? in
             guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
@@ -7258,7 +7369,8 @@ actor ServerNetworkManager {
                 windowID: windowID,
                 workspaceID: resolved.workspaceID,
                 snapshot: resolved.snapshot,
-                runID: runID
+                runID: runID,
+                signalRouting: signalRouting
             )
             let routed = UUID(uuidString: clientID).map { connectionID in
                 windowState.mcpServer.connectionID(forRunID: runID) == connectionID

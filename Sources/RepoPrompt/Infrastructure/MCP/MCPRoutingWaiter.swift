@@ -16,9 +16,14 @@ actor MCPRoutingWaiter {
     private static let terminalStateTTL: TimeInterval = 120 // 2 minutes
 
     /// State for each runID being waited on
+    private struct WaitingContinuation {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+        let timeoutTask: Task<Void, Never>?
+    }
+
     private struct WaitState {
-        var continuations: [(id: UUID, cont: CheckedContinuation<Bool, Never>)] = []
-        var timeoutTask: Task<Void, Never>?
+        var continuations: [WaitingContinuation] = []
         var expiryTask: Task<Void, Never>? // TTL cleanup for terminal states
         var isTerminal: Bool = false // success or failure already signaled
         var didRoute: Bool = false // true if success, false if failure/timeout
@@ -40,8 +45,9 @@ actor MCPRoutingWaiter {
     /// Wait until the runID is routed to a window/connection, or timeout/failure occurs.
     /// - Parameters:
     ///   - runID: The run identifier to watch for routing.
-    ///   - timeoutSeconds: Maximum time to wait. If <= 0, waits indefinitely.
-    /// - Returns: `true` if routing succeeded, `false` on failure or timeout.
+    ///   - timeoutSeconds: Maximum time for this waiter to wait. If <= 0, waits indefinitely.
+    ///     A timeout affects only this waiter; other waiters remain pending for the run-level signal.
+    /// - Returns: `true` if routing succeeded, `false` on failure, cancellation, or this waiter's timeout.
     func waitUntilRouted(runID: UUID, timeoutSeconds: TimeInterval) async -> Bool {
         // Fast path: already resolved
         if let state = waitersByRunID[runID], state.isTerminal {
@@ -55,20 +61,7 @@ actor MCPRoutingWaiter {
             return false
         }
 
-        // Start timeout task if this is the first waiter and timeout > 0
-        if waitersByRunID[runID]!.timeoutTask == nil, timeoutSeconds > 0 {
-            let timeoutNanos = UInt64(timeoutSeconds * 1_000_000_000)
-            waitersByRunID[runID]!.timeoutTask = Task { [weak self] in
-                do {
-                    try await Task.sleep(nanoseconds: timeoutNanos)
-                    await self?.handleTimeout(runID: runID)
-                } catch {
-                    // Task cancelled, no-op
-                }
-            }
-        }
-
-        // Wait via continuation with per-waiter identity for targeted cancellation
+        // Wait via continuation with per-waiter identity for targeted timeout/cancellation.
         let waiterID = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
@@ -76,7 +69,25 @@ actor MCPRoutingWaiter {
                 if let state = waitersByRunID[runID], state.isTerminal {
                     continuation.resume(returning: state.didRoute)
                 } else {
-                    waitersByRunID[runID]?.continuations.append((id: waiterID, cont: continuation))
+                    let timeoutTask: Task<Void, Never>? = if timeoutSeconds > 0 {
+                        Task { [weak self] in
+                            do {
+                                try await Task.sleep(for: .seconds(timeoutSeconds))
+                                await self?.handleTimeout(runID: runID, waiterID: waiterID)
+                            } catch {
+                                // Task cancelled, no-op
+                            }
+                        }
+                    } else {
+                        nil
+                    }
+                    waitersByRunID[runID]?.continuations.append(
+                        WaitingContinuation(
+                            id: waiterID,
+                            continuation: continuation,
+                            timeoutTask: timeoutTask
+                        )
+                    )
                 }
             }
         } onCancel: {
@@ -129,10 +140,6 @@ actor MCPRoutingWaiter {
         state.isTerminal = true
         state.didRoute = routed
 
-        // Cancel timeout task
-        state.timeoutTask?.cancel()
-        state.timeoutTask = nil
-
         // Schedule TTL cleanup for terminal state
         state.expiryTask = scheduleExpiry(runID: runID)
 
@@ -146,7 +153,8 @@ actor MCPRoutingWaiter {
         log.info("resolve: runID=\(runID.uuidString) routed=\(routed) resumingCount=\(continuations.count)")
 
         for waiter in continuations {
-            waiter.cont.resume(returning: routed)
+            waiter.timeoutTask?.cancel()
+            waiter.continuation.resume(returning: routed)
         }
         return true
     }
@@ -172,12 +180,14 @@ actor MCPRoutingWaiter {
         log.debug("TTL expiry: removed terminal state for runID=\(runID.uuidString)")
     }
 
-    private func handleTimeout(runID: UUID) {
-        guard let state = waitersByRunID[runID], !state.isTerminal else {
-            return
-        }
-        log.info("timeout: runID=\(runID.uuidString)")
-        resolve(runID: runID, routed: false)
+    /// Handles timeout of one waiter without terminally resolving the runID.
+    private func handleTimeout(runID: UUID, waiterID: UUID) {
+        guard var state = waitersByRunID[runID], !state.isTerminal else { return }
+        guard let index = state.continuations.firstIndex(where: { $0.id == waiterID }) else { return }
+        let waiter = state.continuations.remove(at: index)
+        waitersByRunID[runID] = state
+        log.info("waiter timeout: runID=\(runID.uuidString) waiterID=\(waiterID.uuidString)")
+        waiter.continuation.resume(returning: false)
     }
 
     /// Handles cancellation of a single waiter without resolving the entire runID.
@@ -188,7 +198,8 @@ actor MCPRoutingWaiter {
         guard let index = state.continuations.firstIndex(where: { $0.id == waiterID }) else { return }
         let waiter = state.continuations.remove(at: index)
         waitersByRunID[runID] = state
-        waiter.cont.resume(returning: false)
+        waiter.timeoutTask?.cancel()
+        waiter.continuation.resume(returning: false)
     }
 
     /// Clean up state for a runID that is no longer needed.
@@ -197,10 +208,10 @@ actor MCPRoutingWaiter {
     /// to free memory sooner when the run is known to be complete.
     func cleanup(runID: UUID) {
         guard let state = waitersByRunID.removeValue(forKey: runID) else { return }
-        state.timeoutTask?.cancel()
         state.expiryTask?.cancel()
         for waiter in state.continuations {
-            waiter.cont.resume(returning: false)
+            waiter.timeoutTask?.cancel()
+            waiter.continuation.resume(returning: false)
         }
         log.debug("cleanup: runID=\(runID.uuidString) resumedCount=\(state.continuations.count)")
     }

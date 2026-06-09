@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPrompt
 import XCTest
 
 final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
@@ -312,6 +312,41 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
     }
 
+    func testNewerCaseDistinctModeNotificationInvalidatesExactConfirmedMode() async throws {
+        #if DEBUG
+            let diagnostics = LockedStrings()
+            let fixture = try makeFixture(
+                shape: "case_collision",
+                extraEnvironment: ["ACP_AFTER_SET_NOTIFICATION_MODE": "plan"],
+                diagnostics: diagnostics
+            )
+            _ = try await fixture.controller.bootstrap()
+            await fixture.controller.debugSuspendNextConfigurationMutationPostcheck()
+            addTeardownBlock {
+                await fixture.controller.debugResumeConfigurationMutationPostcheck()
+            }
+
+            let mutation = Task {
+                try await fixture.controller.setSessionMode("Plan")
+            }
+            try await waitUntilAsync("configuration mutation postcheck suspension") {
+                await fixture.controller.debugIsConfigurationMutationPostcheckSuspended()
+            }
+            try await waitUntil("newer authoritative config update") {
+                diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
+            }
+            await fixture.controller.debugResumeConfigurationMutationPostcheck()
+
+            await assertThrows(containing: "newer ACP configuration state no longer confirms requested mode 'Plan'") {
+                try await mutation.value
+            }
+            await fixture.controller.shutdown()
+            XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
+        #else
+            throw XCTSkip("Configuration mutation suspension is DEBUG-only.")
+        #endif
+    }
+
     func testMalformedNotificationAfterMutationInvalidatesConfirmedMode() async throws {
         let diagnostics = LockedStrings()
         let fixture = try makeFixture(
@@ -352,6 +387,29 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         let mutation = try XCTUnwrap(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").first)
         XCTAssertEqual(mutation.params["configId"] as? String, "model_selector")
         XCTAssertEqual(mutation.params["value"] as? String, "model-b")
+    }
+
+    func testLegacyOnlyModelAdvertisementIsIgnored() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        addTeardownBlock {
+            AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        }
+        let diagnostics = LockedStrings()
+        let fixture = try makeFixture(
+            shape: "none",
+            extraEnvironment: ["ACP_INCLUDE_LEGACY_MODELS": "1"],
+            diagnostics: diagnostics
+        )
+
+        try await withBootstrappedController(fixture.controller) { controller in
+            XCTAssertNil(AgentACPModelRegistry.shared.test_snapshot(providerID: .openCode))
+            await assertThrows(containing: "does not advertise model switching through configOptions") {
+                try await controller.setSessionModel("legacy-model")
+            }
+        }
+
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+        XCTAssertTrue(diagnostics.values.contains { $0.contains("Ignoring legacy ACP models metadata") })
     }
 
     func testMalformedModernModelDoesNotFallBackToLegacyModels() async throws {
@@ -539,6 +597,90 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
+    func testShutdownDrainsPromptSettlementWaitersWithTransportClosed() async throws {
+        #if DEBUG
+            let fixture = try makeFixture(
+                shape: "modern",
+                extraEnvironment: ["ACP_HANG_PROMPT": "1"]
+            )
+            _ = try await fixture.controller.bootstrap()
+            let promptTask = Task {
+                try await fixture.controller.prompt(AgentMessage(userMessage: "hang"))
+            }
+            try await waitUntil("prompt request") {
+                self.recordedRequests(at: fixture.recordURL, method: "session/prompt").count == 1
+            }
+
+            let interruptTask = Task {
+                try await fixture.controller.interruptActivePromptForSteering(timeoutSeconds: 30)
+            }
+            try await waitUntilAsync("prompt settlement waiter") {
+                await fixture.controller.debugPromptSettlementWaiterCount() == 1
+            }
+
+            await fixture.controller.shutdown()
+
+            do {
+                try await interruptTask.value
+                XCTFail("Expected steering interrupt to fail when transport closes")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
+            }
+            do {
+                try await promptTask.value
+                XCTFail("Expected prompt to fail when transport closes")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
+            }
+        #else
+            throw XCTSkip("Prompt settlement waiter inspection is DEBUG-only.")
+        #endif
+    }
+
+    func testProcessExitDrainsPromptSettlementWaitersWithTransportClosed() async throws {
+        #if DEBUG
+            let releaseURL = try makeTemporaryDirectory().appendingPathComponent("exit-release")
+            let fixture = try makeFixture(
+                shape: "modern",
+                extraEnvironment: [
+                    "ACP_HANG_PROMPT": "1",
+                    "ACP_EXIT_ON_CANCEL_RELEASE_PATH": releaseURL.path
+                ]
+            )
+            _ = try await fixture.controller.bootstrap()
+            let promptTask = Task {
+                try await fixture.controller.prompt(AgentMessage(userMessage: "hang"))
+            }
+            try await waitUntil("prompt request") {
+                self.recordedRequests(at: fixture.recordURL, method: "session/prompt").count == 1
+            }
+
+            let interruptTask = Task {
+                try await fixture.controller.interruptActivePromptForSteering(timeoutSeconds: 30)
+            }
+            try await waitUntilAsync("prompt settlement waiter") {
+                await fixture.controller.debugPromptSettlementWaiterCount() == 1
+            }
+            try Data().write(to: releaseURL)
+
+            do {
+                try await interruptTask.value
+                XCTFail("Expected steering interrupt to fail after process exit")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
+            }
+            do {
+                try await promptTask.value
+                XCTFail("Expected prompt to fail after process exit")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
+            }
+            await fixture.controller.shutdown()
+        #else
+            throw XCTSkip("Prompt settlement waiter inspection is DEBUG-only.")
+        #endif
+    }
+
     func testLaunchConfigurationDiagnosticsRedactSecretFlagsAndJSONFields() throws {
         #if DEBUG
             let launchConfiguration = ACPLaunchConfiguration(
@@ -568,6 +710,46 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             }
         #else
             throw XCTSkip("Launch configuration diagnostics are DEBUG-only.")
+        #endif
+    }
+
+    func testRawDebugCaptureRedactsNestedContentAndUsesOwnerOnlyPermissions() throws {
+        #if DEBUG
+            let directory = try makeTemporaryDirectory()
+            let captureURL = directory.appendingPathComponent("raw-acp.jsonl")
+            try Data().write(to: captureURL)
+            try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: captureURL.path)
+            let payload: [String: Any] = [
+                "method": "session/update",
+                "safeLabel": "visible",
+                "params": [
+                    "token": "token-secret",
+                    "nested": [
+                        "password": "password-secret",
+                        "text": "private prompt text",
+                        "label": "nested-visible"
+                    ],
+                    "authorization": "Bearer header-secret"
+                ]
+            ]
+
+            let sanitized = ACPAgentSessionController.debugSanitizedRawCapturePayloadForTesting(payload)
+            let description = String(describing: sanitized)
+            XCTAssertTrue(description.contains("visible"))
+            for secret in ["token-secret", "password-secret", "private prompt text", "header-secret"] {
+                XCTAssertFalse(description.contains(secret), secret)
+            }
+
+            ACPAgentSessionController.debugWriteRawACPEventForTesting(to: captureURL, payload: payload)
+            let contents = try String(contentsOf: captureURL, encoding: .utf8)
+            for secret in ["token-secret", "password-secret", "private prompt text", "header-secret"] {
+                XCTAssertFalse(contents.contains(secret), secret)
+            }
+            let attributes = try FileManager.default.attributesOfItem(atPath: captureURL.path)
+            let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber).intValue
+            XCTAssertEqual(permissions & 0o777, 0o600)
+        #else
+            throw XCTSkip("Raw ACP capture is DEBUG-only.")
         #endif
     }
 
@@ -704,6 +886,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 }
             }
         )
+        addTeardownBlock {
+            await controller.shutdown()
+        }
         return Fixture(controller: controller, recordURL: recordURL, scriptURL: scriptURL)
     }
 
@@ -748,6 +933,19 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if condition() { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Timed out waiting for \(description)")
+    }
+
+    private func waitUntilAsync(
+        _ description: String,
+        timeout: TimeInterval = 3,
+        condition: @escaping () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for \(description)")
@@ -1032,7 +1230,16 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                         )
                 else:
                     respond(request.get("id"), set_config_response())
+            elif method == "session/cancel":
+                exit_release_path = os.environ.get("ACP_EXIT_ON_CANCEL_RELEASE_PATH")
+                if exit_release_path:
+                    while not os.path.exists(exit_release_path):
+                        time.sleep(0.01)
+                    sys.exit(0)
+                continue
             elif method == "session/prompt":
+                if os.environ.get("ACP_HANG_PROMPT") == "1":
+                    continue
                 respond(request.get("id"), {"stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}})
             else:
                 respond(request.get("id"), {})

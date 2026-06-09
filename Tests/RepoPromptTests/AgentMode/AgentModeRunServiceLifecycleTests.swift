@@ -274,6 +274,44 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertTrue(recorder.contains("provider:support"))
             XCTAssertFalse(recorder.contains("factory:acp-controller"))
         }
+
+        do {
+            let recorder = LifecycleRecorder()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: "/usr/bin/true",
+                cancelSupport: true,
+                recorder: recorder
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                acpProviderFactory: { _, _ in
+                    recorder.record("factory:acp-provider")
+                    return provider
+                },
+                acpControllerFactory: { _, _ in
+                    recorder.record("factory:acp-controller")
+                    throw LifecycleTestError.unexpectedACPControllerCreation
+                }
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .openCode
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "cancelled support",
+                initialMessageForRun: "cancelled support",
+                attachments: []
+            )
+
+            XCTAssertNil(outcome)
+            XCTAssertEqual(session.runState, .cancelled)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+            XCTAssertTrue(recorder.contains("provider:support"))
+            XCTAssertFalse(recorder.contains("factory:acp-controller"))
+        }
     }
 
     func testQueuedClaudeSteeringWaitsForMCPIdleThenDrainsOrRestoresDraft() async {
@@ -1565,6 +1603,7 @@ private enum LifecycleCancellationRow: String, CaseIterable {
 private enum LifecycleTestError: LocalizedError {
     case workspaceMissing
     case expectedACPDispatchStop
+    case unexpectedACPControllerCreation
     case expectedClaudeSendFailure
     case expectedCodexSendFailure
 
@@ -1574,6 +1613,8 @@ private enum LifecycleTestError: LocalizedError {
             "Lifecycle test workspace is missing."
         case .expectedACPDispatchStop:
             "Expected ACP dispatch stop."
+        case .unexpectedACPControllerCreation:
+            "ACP controller creation was not expected."
         case .expectedClaudeSendFailure:
             "Expected Claude send failure."
         case .expectedCodexSendFailure:
@@ -1866,10 +1907,14 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
     let commandPath: String
     var environment: [String: String] = [:]
     var supportResult: ACPSupportResult = .supported
+    var cancelSupport = false
     var recorder: LifecycleRecorder?
 
-    func support(for _: ACPRunRequest) async -> ACPSupportResult {
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         recorder?.record("provider:support")
+        if cancelSupport {
+            throw CancellationError()
+        }
         return supportResult
     }
 

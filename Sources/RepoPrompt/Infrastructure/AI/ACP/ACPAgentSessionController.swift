@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 actor ACPAgentSessionController {
@@ -222,9 +223,14 @@ actor ACPAgentSessionController {
     private let diagnosticSink: DiagnosticSink?
     private let requestTimeouts: RequestTimeouts
 
-    /// Modern configOptions are the only mode-selection authority. Mutations are serialized,
+    /// Modern configOptions are the only configuration authority. Mutations are serialized,
     /// and complete snapshots apply in inbound wire order.
     private let configurationMutationMutex = AsyncMutex()
+    #if DEBUG
+        private var debugShouldSuspendNextConfigurationMutationPostcheck = false
+        private var debugConfigurationMutationPostcheckIsSuspended = false
+        private var debugConfigurationMutationPostcheckResumeWaiters: [CheckedContinuation<Void, Never>] = []
+    #endif
 
     private var state: State = .idle
     private var process: SpawnedProcess?
@@ -377,7 +383,7 @@ actor ACPAgentSessionController {
         )
         do {
             if let expectedExecutableIdentity = launchConfiguration.expectedExecutableIdentity {
-                try expectedExecutableIdentity.validate(atPath: resolvedCommand)
+                try expectedExecutableIdentity.validateForTrustedPathLaunch(atPath: resolvedCommand)
             }
         } catch {
             await recordRunLaunchContract(
@@ -668,7 +674,7 @@ actor ACPAgentSessionController {
                     "value": configValue
                 ]
             )
-            try applyVerifiedConfigOptionsMutationResponse(
+            try await applyVerifiedConfigOptionsMutationResponse(
                 response,
                 requiredModeValue: nil,
                 requiredModelValue: configValue
@@ -714,7 +720,7 @@ actor ACPAgentSessionController {
                 "value": canonicalModeID
             ]
         )
-        try applyVerifiedConfigOptionsMutationResponse(
+        try await applyVerifiedConfigOptionsMutationResponse(
             response,
             requiredModeValue: canonicalModeID,
             requiredModelValue: nil
@@ -795,6 +801,12 @@ actor ACPAgentSessionController {
         }
         cancelPendingPermissionRequestsLocally()
     }
+
+    #if DEBUG
+        func debugPromptSettlementWaiterCount() -> Int {
+            promptSettlementWaitersByTurnID.values.reduce(0) { $0 + $1.count }
+        }
+    #endif
 
     func interruptActivePromptForSteering(timeoutSeconds: TimeInterval = 15) async throws {
         guard sessionID != nil else {
@@ -927,6 +939,15 @@ actor ACPAgentSessionController {
         waiter.continuation.resume(throwing: CancellationError())
     }
 
+    private func failAllPromptSettlementWaiters(with error: Error) {
+        activePromptTurnID = nil
+        let waiters = promptSettlementWaitersByTurnID.values.flatMap(\.self)
+        promptSettlementWaitersByTurnID.removeAll()
+        for waiter in waiters {
+            waiter.continuation.resume(throwing: error)
+        }
+    }
+
     private func settlePromptTurn(_ turnID: UUID, result: Result<Void, Error>) {
         if activePromptTurnID == turnID {
             activePromptTurnID = nil
@@ -943,11 +964,15 @@ actor ACPAgentSessionController {
     }
 
     func shutdown() async {
+        #if DEBUG
+            debugResumeConfigurationMutationPostcheck()
+        #endif
         guard state != .closed, state != .closing else { return }
         state = .closing
         log("Shutting down ACP controller")
 
         await cancelPrompt()
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
         failPendingRequests(with: ControllerError.transportClosed)
 
         stdoutChannel?.finish()
@@ -1303,6 +1328,7 @@ actor ACPAgentSessionController {
             emitTerminal(state: .failed, errorText: message)
         }
 
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
         failPendingRequests(with: ControllerError.transportClosed)
         state = .failed
         await clearExpectedAgentPIDIfNeeded()
@@ -2065,11 +2091,41 @@ actor ACPAgentSessionController {
         snapshot.availableValues.isEmpty ? "none" : snapshot.availableValues.joined(separator: ", ")
     }
 
+    #if DEBUG
+        func debugSuspendNextConfigurationMutationPostcheck() {
+            debugShouldSuspendNextConfigurationMutationPostcheck = true
+        }
+
+        func debugIsConfigurationMutationPostcheckSuspended() -> Bool {
+            debugConfigurationMutationPostcheckIsSuspended
+        }
+
+        func debugResumeConfigurationMutationPostcheck() {
+            debugShouldSuspendNextConfigurationMutationPostcheck = false
+            debugConfigurationMutationPostcheckIsSuspended = false
+            let waiters = debugConfigurationMutationPostcheckResumeWaiters
+            debugConfigurationMutationPostcheckResumeWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+
+        private func debugSuspendConfigurationMutationPostcheckIfNeeded() async {
+            guard debugShouldSuspendNextConfigurationMutationPostcheck else { return }
+            debugShouldSuspendNextConfigurationMutationPostcheck = false
+            debugConfigurationMutationPostcheckIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugConfigurationMutationPostcheckResumeWaiters.append(continuation)
+            }
+            debugConfigurationMutationPostcheckIsSuspended = false
+        }
+    #endif
+
     private func applyVerifiedConfigOptionsMutationResponse(
         _ response: RequestResponse,
         requiredModeValue: String?,
         requiredModelValue: String?
-    ) throws {
+    ) async throws {
         guard let configOptions = response.result["configOptions"] as? [[String: Any]] else {
             throw ControllerError.protocolViolation("session/set_config_option response missing complete configOptions snapshot")
         }
@@ -2106,8 +2162,11 @@ actor ACPAgentSessionController {
                 inboundSequence: response.inboundSequence
             )
         }
+        #if DEBUG
+            await debugSuspendConfigurationMutationPostcheckIfNeeded()
+        #endif
         if let requiredModeValue,
-           sessionModeSnapshot?.currentValue.caseInsensitiveCompare(requiredModeValue) != .orderedSame
+           sessionModeSnapshot?.currentValue != requiredModeValue
         {
             throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested mode '\(requiredModeValue)'")
         }
@@ -2204,7 +2263,10 @@ actor ACPAgentSessionController {
         case .absent:
             sessionModelConfigOptionID = nil
             sessionModelFailureReason = nil
-            parsed = parseLegacyModelsSnapshot(from: response["models"] as? [String: Any])
+            parsed = nil
+            if response["models"] != nil {
+                diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+            }
         case let .malformed(reason):
             sessionModelConfigOptionID = nil
             sessionModelFailureReason = reason
@@ -2252,33 +2314,6 @@ actor ACPAgentSessionController {
         }
     }
 
-    private func parseLegacyModelsSnapshot(from models: [String: Any]?) -> ACPDiscoveredSessionModels? {
-        guard let models else { return nil }
-        let currentModelRaw = normalizedACPModelString(models["currentModelId"] as? String)
-        var options = mergeModelOptions(
-            (models["availableModels"] as? [[String: Any]] ?? []).compactMap(parseDiscoveredModelOption)
-        )
-        if let currentModelRaw,
-           !options.contains(where: { $0.rawValue.caseInsensitiveCompare(currentModelRaw) == .orderedSame })
-        {
-            options.insert(
-                AgentModelOption(
-                    rawValue: currentModelRaw,
-                    displayName: currentModelRaw,
-                    description: nil,
-                    isPlaceholderDefault: false,
-                    isProviderDefault: false
-                ),
-                at: 0
-            )
-        }
-        guard !options.isEmpty || currentModelRaw != nil else {
-            diagnose(.info("ACP session response included legacy model metadata, but no usable model entries were found."))
-            return nil
-        }
-        return ACPDiscoveredSessionModels(options: options, currentModelRaw: currentModelRaw)
-    }
-
     private func mergeModelOptions(_ rawOptions: [AgentModelOption]) -> [AgentModelOption] {
         var options: [AgentModelOption] = []
         var seenModelIDs = Set<String>()
@@ -2287,24 +2322,6 @@ actor ACPAgentSessionController {
             options.append(option)
         }
         return options
-    }
-
-    private func parseDiscoveredModelOption(from rawModel: [String: Any]) -> AgentModelOption? {
-        guard let rawValue = normalizedACPModelString(
-            (rawModel["modelId"] as? String) ?? (rawModel["id"] as? String)
-        ) else {
-            return nil
-        }
-        let displayName = normalizedACPModelString(
-            (rawModel["name"] as? String) ?? (rawModel["displayName"] as? String)
-        ) ?? rawValue
-        return AgentModelOption(
-            rawValue: rawValue,
-            displayName: displayName,
-            description: normalizedACPModelString(rawModel["description"] as? String),
-            isPlaceholderDefault: false,
-            isProviderDefault: rawModel["isDefault"] as? Bool ?? false
-        )
     }
 
     private func parseDiscoveredConfigModelOption(from rawOption: [String: Any]) -> AgentModelOption? {
@@ -2960,6 +2977,23 @@ actor ACPAgentSessionController {
             launchConfigurationTracePayload(launchConfiguration)
         }
 
+        static func debugSanitizedRawCapturePayloadForTesting(_ payload: [String: Any]) -> [String: Any] {
+            sanitizeRawCaptureDictionary(payload)
+        }
+
+        static func debugWriteRawACPEventForTesting(to url: URL, payload: [String: Any]) {
+            writeRawACPEvent(
+                to: url,
+                kind: "test",
+                payload: payload,
+                providerID: .cursor,
+                controllerState: State.idle.rawValue,
+                hasActivePromptTurn: false,
+                suppressSessionLoadReplayUpdates: false,
+                sessionID: nil
+            )
+        }
+
         private static func launchConfigurationTracePayload(_ launchConfiguration: ACPLaunchConfiguration) -> [String: Any] {
             var payload: [String: Any] = [
                 "command": launchConfiguration.command,
@@ -3247,6 +3281,8 @@ actor ACPAgentSessionController {
             )
         }
 
+        private static let rawACPCaptureWriteLock = NSLock()
+
         private static func writeRawACPEvent(
             to url: URL,
             kind: String,
@@ -3260,7 +3296,7 @@ actor ACPAgentSessionController {
             var record: [String: Any] = [
                 "capturedAt": ISO8601DateFormatter().string(from: Date()),
                 "kind": kind,
-                "payload": payload,
+                "payload": sanitizeRawCaptureDictionary(payload),
                 "providerID": providerID.rawValue,
                 "controllerState": controllerState,
                 "hasActivePromptTurn": hasActivePromptTurn,
@@ -3270,21 +3306,68 @@ actor ACPAgentSessionController {
                 record["controllerSessionID"] = sessionID
             }
             guard JSONSerialization.isValidJSONObject(record),
-                  let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+                  var data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
             else {
                 return
             }
-            let newline = Data([0x0A])
+            data.append(0x0A)
+
             let parent = url.deletingLastPathComponent()
             _ = try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true, attributes: nil)
-            if !FileManager.default.fileExists(atPath: url.path) {
-                _ = FileManager.default.createFile(atPath: url.path, contents: nil)
+
+            rawACPCaptureWriteLock.lock()
+            defer { rawACPCaptureWriteLock.unlock() }
+            let descriptor = Darwin.open(
+                url.path,
+                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+                mode_t(0o600)
+            )
+            guard descriptor >= 0 else { return }
+            defer { _ = Darwin.close(descriptor) }
+            guard fchmod(descriptor, mode_t(0o600)) == 0 else { return }
+            try? FDWriteSupport.writeAll(data, to: descriptor)
+        }
+
+        private static func sanitizeRawCaptureDictionary(_ dictionary: [String: Any]) -> [String: Any] {
+            Dictionary(uniqueKeysWithValues: dictionary.map { key, value in
+                (key, sanitizeRawCaptureValue(value, key: key))
+            })
+        }
+
+        private static func sanitizeRawCaptureValue(_ value: Any, key: String?) -> Any {
+            if let key, isSensitiveRawCaptureKey(key) {
+                return "<redacted>"
             }
-            guard let handle = try? FileHandle(forWritingTo: url) else { return }
-            defer { _ = try? handle.close() }
-            _ = try? handle.seekToEnd()
-            _ = try? handle.write(contentsOf: data)
-            _ = try? handle.write(contentsOf: newline)
+            if let dictionary = value as? [String: Any] {
+                return sanitizeRawCaptureDictionary(dictionary)
+            }
+            if let array = value as? [Any] {
+                return array.map { sanitizeRawCaptureValue($0, key: nil) }
+            }
+            if let string = value as? String, looksSensitiveRawCaptureString(string) {
+                return "<redacted>"
+            }
+            return value
+        }
+
+        private static func isSensitiveRawCaptureKey(_ key: String) -> Bool {
+            let normalized = key.lowercased().filter(\.isLetter)
+            return [
+                "argument", "authorization", "command", "content", "cookie", "credential",
+                "cwd", "data", "diagnostic", "environment", "error", "key", "output",
+                "password", "path", "prompt", "rawinput", "reasoning", "response", "result",
+                "secret", "text", "token", "uri", "value", "workingdirectory"
+            ].contains { normalized.contains($0) }
+        }
+
+        private static func looksSensitiveRawCaptureString(_ value: String) -> Bool {
+            let normalized = value.lowercased()
+            return normalized.contains("bearer ")
+                || normalized.contains("api_key=")
+                || normalized.contains("apikey=")
+                || normalized.contains("access_token=")
+                || normalized.contains("password=")
+                || normalized.contains("secret=")
         }
     #endif
 

@@ -180,7 +180,7 @@ enum NormalizedAgentRuntimeEvent {
 protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
 
-    func support(for request: ACPRunRequest) async -> ACPSupportResult
+    func support(for request: ACPRunRequest) async throws -> ACPSupportResult
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration
     func makeSessionConfiguration(
         for request: ACPRunRequest,

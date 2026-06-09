@@ -20,6 +20,7 @@ struct CursorACPResolvedLaunch: Equatable {
     let command: String
     let arguments: [String]
     let additionalPathHints: [String]
+    let environment: [String: String]
     let executableIdentity: ExecutableFileIdentity
 }
 
@@ -75,7 +76,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         let key = cacheKey(for: config)
         if let cached = cachedLaunch(forKey: key) {
             do {
-                try cached.executableIdentity.validate(atPath: cached.command)
+                try cached.executableIdentity.validateForTrustedPathLaunch(atPath: cached.command)
                 return cached
             } catch {
                 invalidate(key: key)
@@ -88,17 +89,13 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         return launch
     }
 
-    func probeSupport(for config: CursorAgentConfig) async -> ACPSupportResult {
-        do {
-            return try await probeMutex.withLock { [self] in
-                await probeSupportSerially(for: config)
-            }
-        } catch {
-            return .unsupported(reason: error.localizedDescription)
+    func probeSupport(for config: CursorAgentConfig) async throws -> ACPSupportResult {
+        try await probeMutex.withLock { [self] in
+            try await probeSupportSerially(for: config)
         }
     }
 
-    private func probeSupportSerially(for config: CursorAgentConfig) async -> ACPSupportResult {
+    private func probeSupportSerially(for config: CursorAgentConfig) async throws -> ACPSupportResult {
         let key = cacheKey(for: config)
         invalidate(key: key)
         do {
@@ -114,7 +111,8 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
                 args: CursorACPLaunchCandidate.cursorAgentACP.helpArguments,
                 stdin: nil,
                 outputMode: .none,
-                timeout: 10
+                timeout: 10,
+                cancelChildOnTaskCancellation: true
             )
             guard result.status == 0 else {
                 return .unsupported(
@@ -133,9 +131,12 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
                 )
             }
 
-            try launch.executableIdentity.validate(atPath: launch.command)
+            try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
             cache(launch, key: key)
             return .supported
+        } catch is CancellationError {
+            invalidate(key: key)
+            throw CancellationError()
         } catch {
             invalidate(key: key)
             return .unsupported(reason: error.localizedDescription)
@@ -145,6 +146,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     private func resolveLaunchForProbe(for config: CursorAgentConfig) async throws -> CursorACPResolvedLaunch {
         let configuredCommand = try validatedConfiguredCommand(config)
         let environment = await environmentProvider(config.enableDebugLogging)
+        try Task.checkCancellation()
         if configuredCommand.contains("/") {
             return try resolveExplicitLaunch(for: config, environment: environment)
         }
@@ -159,7 +161,8 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         return try validatedLaunch(
             entryPath: resolved,
             configuredCommand: configuredCommand,
-            additionalPathHints: effectiveHints
+            additionalPathHints: effectiveHints,
+            environment: environment
         )
     }
 
@@ -176,7 +179,8 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         return try validatedLaunch(
             entryPath: expanded,
             configuredCommand: configuredCommand,
-            additionalPathHints: effectiveHints
+            additionalPathHints: effectiveHints,
+            environment: environment
         )
     }
 
@@ -199,7 +203,8 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     private func validatedLaunch(
         entryPath: String,
         configuredCommand: String,
-        additionalPathHints: [String]
+        additionalPathHints: [String],
+        environment: [String: String]
     ) throws -> CursorACPResolvedLaunch {
         guard entryPath.hasPrefix("/"),
               URL(fileURLWithPath: entryPath).lastPathComponent.caseInsensitiveCompare(CursorACPLaunchCandidate.cursorAgentACP.command) == .orderedSame
@@ -209,7 +214,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
 
         let identity: ExecutableFileIdentity
         do {
-            identity = try ExecutableFileIdentity.capture(atPath: entryPath)
+            identity = try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: entryPath)
         } catch {
             throw CursorACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
@@ -226,6 +231,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             command: identity.canonicalPath,
             arguments: CursorACPLaunchCandidate.cursorAgentACP.launchArguments,
             additionalPathHints: additionalPathHints,
+            environment: environment,
             executableIdentity: identity
         )
     }

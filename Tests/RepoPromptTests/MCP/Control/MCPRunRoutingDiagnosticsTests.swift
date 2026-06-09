@@ -144,6 +144,40 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
         #endif
     }
 
+    func testRoutingWaiterTimeoutIsPerWaiterAndDoesNotResolveRun() async throws {
+        #if DEBUG
+            let runID = UUID()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+            await MCPRoutingWaiter.register(runID: runID)
+
+            let shortWaiter = Task {
+                await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: 0.01)
+            }
+            let longWaiter = Task {
+                await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: 5)
+            }
+            var continuationCount = 0
+            for _ in 0 ..< 100 {
+                continuationCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+                if continuationCount == 2 { break }
+                await Task.yield()
+            }
+            XCTAssertEqual(continuationCount, 2)
+
+            let shortResult = await shortWaiter.value
+            let remainingWaiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            XCTAssertFalse(shortResult)
+            XCTAssertEqual(remainingWaiterCount, 1)
+
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+            let longResult = await longWaiter.value
+            XCTAssertTrue(longResult)
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Routing waiter continuation inspection is DEBUG-only.")
+        #endif
+    }
+
     func testRoutingWaiterCleanupResumesUnresolvedWaitersAsFailure() async throws {
         #if DEBUG
             let runID = UUID()

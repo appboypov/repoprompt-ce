@@ -53,7 +53,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
         let key = cacheKey(for: config)
         if let cached = cachedLaunch(forKey: key) {
             do {
-                try cached.executableIdentity.validate(atPath: cached.command)
+                try cached.executableIdentity.validateForTrustedPathLaunch(atPath: cached.command)
                 return cached
             } catch {
                 invalidate(key: key)
@@ -66,17 +66,13 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
         return launch
     }
 
-    func probeSupport(for config: OpenCodeAgentConfig) async -> ACPSupportResult {
-        do {
-            return try await probeMutex.withLock { [self] in
-                await probeSupportSerially(for: config)
-            }
-        } catch {
-            return .unsupported(reason: error.localizedDescription)
+    func probeSupport(for config: OpenCodeAgentConfig) async throws -> ACPSupportResult {
+        try await probeMutex.withLock { [self] in
+            try await probeSupportSerially(for: config)
         }
     }
 
-    private func probeSupportSerially(for config: OpenCodeAgentConfig) async -> ACPSupportResult {
+    private func probeSupportSerially(for config: OpenCodeAgentConfig) async throws -> ACPSupportResult {
         let key = cacheKey(for: config)
         invalidate(key: key)
         do {
@@ -92,7 +88,8 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
                 args: Self.helpArguments,
                 stdin: nil,
                 outputMode: .none,
-                timeout: 10
+                timeout: 10,
+                cancelChildOnTaskCancellation: true
             )
             guard result.status == 0 else {
                 return .unsupported(
@@ -106,9 +103,12 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
                 return .unsupported(reason: "Installed OpenCode CLI does not advertise ACP support.")
             }
 
-            try launch.executableIdentity.validate(atPath: launch.command)
+            try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
             cache(launch, key: key)
             return .supported
+        } catch is CancellationError {
+            invalidate(key: key)
+            throw CancellationError()
         } catch {
             invalidate(key: key)
             return .unsupported(reason: error.localizedDescription)
@@ -118,6 +118,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
     private func resolveLaunchForProbe(for config: OpenCodeAgentConfig) async throws -> OpenCodeACPResolvedLaunch {
         let configuredCommand = try validatedConfiguredCommand(config)
         let environment = await environmentProvider(config.enableDebugLogging)
+        try Task.checkCancellation()
         if configuredCommand.contains("/") {
             return try resolveExplicitLaunch(for: config, environment: environment)
         }
@@ -171,7 +172,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
 
         let identity: ExecutableFileIdentity
         do {
-            identity = try ExecutableFileIdentity.capture(atPath: entryPath)
+            identity = try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: entryPath)
         } catch {
             throw OpenCodeACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
