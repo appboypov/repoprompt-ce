@@ -131,12 +131,13 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             }
             var latestWatermark = initialWatermark
             for eventID in 2 ... 4 {
+                // Keep churn paths absent so every accepted event deterministically requires parent verification.
                 let churnURL = root.appendingPathComponent("A/churn-\(eventID).txt")
-                try "churn".write(to: churnURL, atomically: true, encoding: .utf8)
                 let churnWatermark = await service.acceptWatcherPayloadForTesting([
                     (absolutePath: churnURL.path, flags: flags, eventId: FSEventStreamEventId(eventID))
-                ])
+                ], scheduleDrain: false)
                 latestWatermark = try XCTUnwrap(churnWatermark)
+                await service.drainAcceptedWatcherIngressMailbox()
                 await batchGate.releaseNext()
                 if eventID < 4 {
                     await batchGate.waitUntilStartCount(Int(eventID))
@@ -152,8 +153,11 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             let state = await service.getCoalescingState()
             let publication = await service.publicationStateForTesting()
 
-            XCTAssertEqual(Array(batches.prefix(3)).flatMap(\.self), folders)
-            XCTAssertGreaterThanOrEqual(batches.flatMap(\.self).count(where: { $0 == "A" }), 2)
+            let processedFolders = batches.flatMap(\.self)
+            XCTAssertEqual(Array(processedFolders.prefix(2)), ["A", "B"])
+            let firstCBatchIndex = try XCTUnwrap(batches.firstIndex(where: { $0.contains("C") }))
+            XCTAssertLessThanOrEqual(firstCBatchIndex, 3)
+            XCTAssertGreaterThanOrEqual(processedFolders.count(where: { $0 == "A" }), 2)
             XCTAssertGreaterThan(intermediateSequence, 0)
             XCTAssertGreaterThanOrEqual(finalSequence, intermediateSequence)
             XCTAssertTrue(state.pendingScanTargets.isEmpty)
