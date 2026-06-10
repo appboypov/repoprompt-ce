@@ -993,7 +993,7 @@ extension MCPServerViewModel {
             return workspaceManager?.activeWorkspace?.id
         }()
 
-        var context = makeTabContextSnapshot(
+        let context = makeTabContextSnapshot(
             from: snapshot,
             workspaceID: resolvedWorkspaceID,
             windowID: windowID,
@@ -1002,7 +1002,46 @@ extension MCPServerViewModel {
             captureActiveUIState: false,
             flushActiveSelection: false
         )
+        return installTabContext(
+            clientID: clientID,
+            clientName: clientName,
+            windowID: windowID,
+            context: context,
+            signalRouting: signalRouting,
+            deferRunIDReplacementForPendingPolicy: deferRunIDReplacementForPendingPolicy
+        )
+    }
 
+    @MainActor
+    @discardableResult
+    func installFrozenTabContext(
+        clientID: String?,
+        clientName: String?,
+        context: TabContextSnapshot,
+        signalRouting: Bool = true,
+        deferRunIDReplacementForPendingPolicy: Bool = false
+    ) -> PendingPolicyRunIDMappingToken? {
+        tabContextLog("installFrozenTabContext tab=\(context.tabID) window=\(context.windowID) clientID=\(clientID ?? "nil") clientName=\(clientName ?? "nil") runID=\(context.runID?.uuidString ?? "nil")")
+        return installTabContext(
+            clientID: clientID,
+            clientName: clientName,
+            windowID: context.windowID,
+            context: context,
+            signalRouting: signalRouting,
+            deferRunIDReplacementForPendingPolicy: deferRunIDReplacementForPendingPolicy
+        )
+    }
+
+    @MainActor
+    private func installTabContext(
+        clientID: String?,
+        clientName: String?,
+        windowID: Int,
+        context initialContext: TabContextSnapshot,
+        signalRouting: Bool,
+        deferRunIDReplacementForPendingPolicy: Bool
+    ) -> PendingPolicyRunIDMappingToken? {
+        var context = initialContext
         if let clientID,
            let uuid = UUID(uuidString: clientID)
         {
