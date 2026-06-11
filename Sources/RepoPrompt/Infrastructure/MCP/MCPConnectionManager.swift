@@ -341,7 +341,10 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
 }
 
 enum MCPConnectionCallLane: String, CaseIterable {
+    /// Legacy diagnostics name for the explicit exclusive class.
     case ordinary
+    case smallRead = "small_read"
+    case gitRead = "git_read"
     case fileSearch = "file_search"
 }
 
@@ -362,14 +365,20 @@ actor ServerNetworkManager {
         toolNameAliases[name] ?? name
     }
 
-    nonisolated static func callLane(forCanonicalToolName toolName: String) -> MCPConnectionCallLane {
-        toolName == MCPWindowToolName.search ? .fileSearch : .ordinary
+    nonisolated static func admissionClass(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
+        MCPToolAdmissionPolicy.classification(forCanonicalToolName: toolName)
     }
 
-    /// Bounded concurrent `file_search` permits per connection. Sized to the parallel
-    /// read-only tool batches agent clients emit, and aligned with the per-workspace
-    /// broad-search active capacity so one connection's burst cannot exceed it.
-    nonisolated static let fileSearchCallLaneLimit = 4
+    nonisolated static func callLane(forCanonicalToolName toolName: String) -> MCPConnectionCallLane? {
+        admissionClass(forCanonicalToolName: toolName)?.connectionLane
+    }
+
+    nonisolated static let smallReadCallLaneLimit = MCPToolAdmissionPolicy.smallReadConnectionLimit
+    nonisolated static let gitReadCallLaneLimit = MCPToolAdmissionPolicy.gitReadConnectionLimit
+
+    /// Bounded concurrent `file_search` permits per connection. This remains aligned with
+    /// PR #155's per-workspace broad-search active capacity.
+    nonisolated static let fileSearchCallLaneLimit = MCPToolAdmissionPolicy.fileSearchConnectionLimit
 
     private static func validatedLiveRunID(
         candidateRunID: UUID,
@@ -1034,6 +1043,8 @@ actor ServerNetworkManager {
         }
 
         private let ordinary: AsyncLimiter
+        private let smallRead: AsyncLimiter
+        private let gitRead: AsyncLimiter
         private let fileSearch: AsyncLimiter
         private var admittedCallCount = 0
         private var admissionCloseState: AdmissionCloseState = .open
@@ -1042,17 +1053,23 @@ actor ServerNetworkManager {
         #if DEBUG
             init(
                 limit: Int,
+                smallReadLimit: Int,
+                gitReadLimit: Int,
                 fileSearchLimit: Int,
                 idleWaitSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
                     try await Task.sleep(for: duration)
                 }
             ) {
                 ordinary = AsyncLimiter(limit: limit, idleWaitSleep: idleWaitSleep)
+                smallRead = AsyncLimiter(limit: smallReadLimit, idleWaitSleep: idleWaitSleep)
+                gitRead = AsyncLimiter(limit: gitReadLimit, idleWaitSleep: idleWaitSleep)
                 fileSearch = AsyncLimiter(limit: fileSearchLimit, idleWaitSleep: idleWaitSleep)
             }
         #else
-            init(limit: Int, fileSearchLimit: Int) {
+            init(limit: Int, smallReadLimit: Int, gitReadLimit: Int, fileSearchLimit: Int) {
                 ordinary = AsyncLimiter(limit: limit)
+                smallRead = AsyncLimiter(limit: smallReadLimit)
+                gitRead = AsyncLimiter(limit: gitReadLimit)
                 fileSearch = AsyncLimiter(limit: fileSearchLimit)
             }
         #endif
@@ -1274,9 +1291,13 @@ actor ServerNetworkManager {
 
             func diagnosticsSnapshot() async -> MCPConnectionCallLimiterDebugSnapshot {
                 async let ordinarySnapshot = ordinary.debugSnapshot()
+                async let smallReadSnapshot = smallRead.debugSnapshot()
+                async let gitReadSnapshot = gitRead.debugSnapshot()
                 async let fileSearchSnapshot = fileSearch.debugSnapshot()
                 return await MCPConnectionCallLimiterDebugSnapshot(
                     ordinary: ordinarySnapshot,
+                    smallRead: smallReadSnapshot,
+                    gitRead: gitReadSnapshot,
                     fileSearch: fileSearchSnapshot
                 )
             }
@@ -1326,21 +1347,32 @@ actor ServerNetworkManager {
 
         private func closeLanes() async {
             async let cancelOrdinary: Void = ordinary.cancelAll()
+            async let cancelSmallRead: Void = smallRead.cancelAll()
+            async let cancelGitRead: Void = gitRead.cancelAll()
             async let cancelFileSearch: Void = fileSearch.cancelAll()
-            _ = await (cancelOrdinary, cancelFileSearch)
+            _ = await (cancelOrdinary, cancelSmallRead, cancelGitRead, cancelFileSearch)
         }
 
         private func limiter(for lane: MCPConnectionCallLane) -> AsyncLimiter {
             switch lane {
             case .ordinary:
                 ordinary
+            case .smallRead:
+                smallRead
+            case .gitRead:
+                gitRead
             case .fileSearch:
                 fileSearch
             }
         }
 
         private var lanes: [(MCPConnectionCallLane, AsyncLimiter)] {
-            [(.ordinary, ordinary), (.fileSearch, fileSearch)]
+            [
+                (.ordinary, ordinary),
+                (.smallRead, smallRead),
+                (.gitRead, gitRead),
+                (.fileSearch, fileSearch)
+            ]
         }
     }
 
@@ -1348,6 +1380,14 @@ actor ServerNetworkManager {
     private var activeConnectionsByClient: [String: Set<UUID>] = [:]
     private var clientIDByConnection: [UUID: String] = [:]
     private var callLimiters: [UUID: MCPConnectionCallLimiters] = [:]
+
+    private nonisolated let mutationAdmissionController = MCPToolResourceAdmissionController(
+        limit: MCPToolAdmissionPolicy.exclusiveConnectionLimit
+    )
+    private nonisolated let smallReadAdmissionController = MCPToolResourceAdmissionController(
+        limit: MCPToolAdmissionPolicy.smallReadPerWindowLimit
+    )
+    private nonisolated let toolCardOwnershipLedger = MCPToolCardOwnershipLedger()
     #if DEBUG
         private var debugAfterDirectAdmissionPendingPublishedForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterBootstrapPolicyReadinessForTesting: (@Sendable (String) async -> Void)?
@@ -4643,6 +4683,8 @@ actor ServerNetworkManager {
         connections[connectionID] = manager
         callLimiters[connectionID] = MCPConnectionCallLimiters(
             limit: limiterLimit(for: connectionID),
+            smallReadLimit: smallReadLimiterLimit(for: connectionID),
+            gitReadLimit: gitReadLimiterLimit(for: connectionID),
             fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
         )
         connectionLifecycleGenerationByID[connectionID] = lifecycleGeneration
@@ -8020,6 +8062,8 @@ actor ServerNetworkManager {
             ) async -> AsyncLimiter {
                 let limiters = MCPConnectionCallLimiters(
                     limit: limiterLimit(for: connectionID),
+                    smallReadLimit: smallReadLimiterLimit(for: connectionID),
+                    gitReadLimit: gitReadLimiterLimit(for: connectionID),
                     fileSearchLimit: fileSearchLimiterLimit(for: connectionID),
                     idleWaitSleep: idleWaitSleep
                 )
@@ -8053,6 +8097,8 @@ actor ServerNetworkManager {
                 clientIDByConnection[connectionID] = clientID
                 callLimiters[connectionID] = MCPConnectionCallLimiters(
                     limit: limiterLimit(for: connectionID),
+                    smallReadLimit: smallReadLimiterLimit(for: connectionID),
+                    gitReadLimit: gitReadLimiterLimit(for: connectionID),
                     fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                 )
                 connectionStats[connectionID] = ConnectionStats(
@@ -8373,6 +8419,8 @@ actor ServerNetworkManager {
                 if callLimiters[connectionID] == nil {
                     callLimiters[connectionID] = MCPConnectionCallLimiters(
                         limit: limiterLimit(for: connectionID),
+                        smallReadLimit: smallReadLimiterLimit(for: connectionID),
+                        gitReadLimit: gitReadLimiterLimit(for: connectionID),
                         fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                     )
                 }
@@ -10195,8 +10243,16 @@ actor ServerNetworkManager {
                 EditFlowPerf.Dimensions(toolName: toolName)
             )
 
-            // Per-connection call lanes preserve ordinary FIFO while isolating serialized searches.
-            let callLane = Self.callLane(forCanonicalToolName: toolName)
+            // Connection lanes provide bounded FIFO admission only. Shared-state correctness is
+            // enforced below by explicit window/app/repository resource ownership.
+            guard let admissionClass = Self.admissionClass(forCanonicalToolName: toolName) else {
+                return Self.executionContractToolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    code: "tool_execution_admission_unclassified",
+                    message: "No static admission classification exists for tool '\(toolName)'."
+                )
+            }
+            let callLane = admissionClass.connectionLane
             connectionLog("tools/call \(toolName): acquiring limiter lane=\(callLane.rawValue)")
             let limiterResolution = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.limiterResolution,
@@ -10440,6 +10496,78 @@ actor ServerNetworkManager {
                                         ? nil
                                         : await self.runIDForConnection(connectionID)
                                 }
+                                let mutationAdmissionLease: MCPToolResourceAdmissionController.Lease?
+                                if admissionClass == .exclusive {
+                                    let mutationResource: MCPToolResourceAdmissionController.Resource
+                                    if MCPGlobalToolName.orderedToolNames.contains(toolName) {
+                                        mutationResource = .appWide
+                                    } else if let chosenID {
+                                        mutationResource = .window(chosenID)
+                                    } else {
+                                        return Self.executionContractToolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            code: "tool_execution_mutation_resource_unresolved",
+                                            message: "The exclusive tool '\(toolName)' has no resolved window resource."
+                                        )
+                                    }
+                                    do {
+                                        mutationAdmissionLease = try await self.mutationAdmissionController.acquire(mutationResource)
+                                    } catch {
+                                        return Self.executionContractToolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            code: "tool_execution_connection_terminal",
+                                            message: "The MCP connection closed while waiting for exclusive resource admission."
+                                        )
+                                    }
+                                } else {
+                                    mutationAdmissionLease = nil
+                                }
+                                defer { mutationAdmissionLease?.release() }
+
+                                let smallReadAdmissionLease: MCPToolResourceAdmissionController.Lease?
+                                if admissionClass == .smallRead {
+                                    guard let chosenID else {
+                                        return Self.executionContractToolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            code: "tool_execution_read_resource_unresolved",
+                                            message: "The small-read tool '\(toolName)' has no resolved window/store resource."
+                                        )
+                                    }
+                                    do {
+                                        smallReadAdmissionLease = try await self.smallReadAdmissionController.acquire(.window(chosenID))
+                                    } catch {
+                                        return Self.executionContractToolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            code: "tool_execution_connection_terminal",
+                                            message: "The MCP connection closed while waiting for window/store read admission."
+                                        )
+                                    }
+                                } else {
+                                    smallReadAdmissionLease = nil
+                                }
+                                defer { smallReadAdmissionLease?.release() }
+
+                                let toolCardOwnershipLease: MCPToolCardOwnershipLedger.Lease?
+                                if let runID = observerRunIDForCallbacksFinal, let chosenID {
+                                    guard let lease = self.toolCardOwnershipLedger.begin(
+                                        windowID: chosenID,
+                                        runID: runID,
+                                        invocationID: invocationID,
+                                        connectionID: connectionID,
+                                        toolName: toolName
+                                    ) else {
+                                        return Self.executionContractToolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            code: "tool_card_ownership_conflict",
+                                            message: "Duplicate tool-card ownership was rejected for invocation \(invocationID.uuidString)."
+                                        )
+                                    }
+                                    toolCardOwnershipLease = lease
+                                } else {
+                                    toolCardOwnershipLease = nil
+                                }
+                                defer { toolCardOwnershipLease?.release() }
+
                                 if let runID = observerRunIDForCallbacksFinal {
                                     let observerState = EditFlowPerf.begin(
                                         EditFlowPerf.Stage.MCPToolCall.observerCallbacks,
@@ -11966,10 +12094,19 @@ actor ServerNetworkManager {
     }
 
     private func limiterLimit(for connectionID: UUID) -> Int {
-        // Serialize ordinary RepoPrompt MCP tool calls within each connection.
-        // Identical calls therefore cannot race and produce duplicate/mis-tracked tool cards.
+        // The legacy `ordinary` lane is now the explicit exclusive class only.
         _ = connectionID
-        return 1
+        return MCPToolAdmissionPolicy.exclusiveConnectionLimit
+    }
+
+    private func smallReadLimiterLimit(for connectionID: UUID) -> Int {
+        _ = connectionID
+        return Self.smallReadCallLaneLimit
+    }
+
+    private func gitReadLimiterLimit(for connectionID: UUID) -> Int {
+        _ = connectionID
+        return Self.gitReadCallLaneLimit
     }
 
     private func fileSearchLimiterLimit(for connectionID: UUID) -> Int {
@@ -12367,6 +12504,8 @@ actor ServerNetworkManager {
         // observe cancellation, while all subsequent calls resolve these fresh open lanes.
         let replacement = MCPConnectionCallLimiters(
             limit: limiterLimit(for: id),
+            smallReadLimit: smallReadLimiterLimit(for: id),
+            gitReadLimit: gitReadLimiterLimit(for: id),
             fileSearchLimit: fileSearchLimiterLimit(for: id)
         )
         callLimiters[id] = replacement
@@ -12881,6 +13020,8 @@ actor ServerNetworkManager {
 #if DEBUG
     struct MCPConnectionCallLimiterDebugSnapshot: Equatable {
         let ordinary: AsyncLimiter.DebugSnapshot
+        let smallRead: AsyncLimiter.DebugSnapshot
+        let gitRead: AsyncLimiter.DebugSnapshot
         let fileSearch: AsyncLimiter.DebugSnapshot
 
         var laneCount: Int {
@@ -12888,41 +13029,46 @@ actor ServerNetworkManager {
         }
 
         var limit: Int {
-            ordinary.limit + fileSearch.limit
+            ordinary.limit + smallRead.limit + gitRead.limit + fileSearch.limit
         }
 
         var permits: Int {
-            ordinary.permits + fileSearch.permits
+            ordinary.permits + smallRead.permits + gitRead.permits + fileSearch.permits
         }
 
         var activePermitCount: Int {
-            ordinary.activePermitCount + fileSearch.activePermitCount
+            ordinary.activePermitCount + smallRead.activePermitCount + gitRead.activePermitCount + fileSearch.activePermitCount
         }
 
         var waiterCount: Int {
-            ordinary.waiterCount + fileSearch.waiterCount
+            ordinary.waiterCount + smallRead.waiterCount + gitRead.waiterCount + fileSearch.waiterCount
         }
 
         var inFlight: Int {
-            ordinary.inFlight + fileSearch.inFlight
+            ordinary.inFlight + smallRead.inFlight + gitRead.inFlight + fileSearch.inFlight
         }
 
         var oldestWaiterAgeMilliseconds: UInt64? {
-            [ordinary.oldestWaiterAgeMilliseconds, fileSearch.oldestWaiterAgeMilliseconds]
-                .compactMap(\.self)
-                .max()
+            [
+                ordinary.oldestWaiterAgeMilliseconds,
+                smallRead.oldestWaiterAgeMilliseconds,
+                gitRead.oldestWaiterAgeMilliseconds,
+                fileSearch.oldestWaiterAgeMilliseconds
+            ]
+            .compactMap(\.self)
+            .max()
         }
 
         var cancelledWaiterCount: Int {
-            ordinary.cancelledWaiterCount + fileSearch.cancelledWaiterCount
+            ordinary.cancelledWaiterCount + smallRead.cancelledWaiterCount + gitRead.cancelledWaiterCount + fileSearch.cancelledWaiterCount
         }
 
         var isClosed: Bool {
-            ordinary.isClosed && fileSearch.isClosed
+            ordinary.isClosed && smallRead.isClosed && gitRead.isClosed && fileSearch.isClosed
         }
 
         var isIdle: Bool {
-            ordinary.isIdle && fileSearch.isIdle
+            ordinary.isIdle && smallRead.isIdle && gitRead.isIdle && fileSearch.isIdle
         }
     }
 #endif

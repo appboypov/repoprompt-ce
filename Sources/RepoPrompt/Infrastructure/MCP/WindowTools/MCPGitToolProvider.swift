@@ -412,6 +412,13 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             }
         }
 
+        // Tool-level admission is keyed by every repository touched by this request. WI-9's
+        // lower-level global/per-repository subprocess controller remains independently active.
+        let gitAdmissionLease = try await MCPGitToolAdmissionController.shared.acquire(
+            repositoryKeys: repos.map(\.rootPath)
+        )
+        defer { MCPGitToolAdmissionController.shared.release(gitAdmissionLease) }
+
         // For now, use primary repo for single-repo operations
         // Multi-root execution will be implemented for operations that benefit from it (status, diff)
         MCPToolWorkCountDiagnostics.setGitRepositories(repos.map(\.repoKey))

@@ -65,7 +65,7 @@ Improve MCP throughput across same-connection bursts, parallel agent threads, lo
 - [x] Phase 1 / WI-7 — `read_file` content reuse and freshness narrowing
 - [x] Phase 2 / WI-8 — off-MainActor provider projection
 - [x] Phase 2 / WI-9 — bounded Git concurrency and command consolidation
-- [ ] Phase 2 / WI-10 — classified, resource-keyed ordinary-tool admission
+- [x] Phase 2 / WI-10 — classified, resource-keyed ordinary-tool admission
 - [ ] Phase 3 / WI-11 — immutable per-root catalog shards and scope composition
 - [ ] Phase 3 / WI-12 — canonical delta application to shards
 - [ ] Phase 3 / WI-13 — per-root path indexes with global top-k merge
@@ -252,6 +252,8 @@ WI-8/WI-9 reduce the cost of work wherever it is scheduled; WI-10 then changes s
 - Replace the single ordinary limit-1 lane (`MCPConnectionManager.swift:11623-11636`) with a static classification: mutating selection/prompt/workspace/settings, lifecycle, approval, and interactive tools stay serial/exclusive; small read/snapshot tools get a bounded lane (initial 2–4 per connection); Git reads get a bounded lane (1–2 per repository plus the WI-9 global process budget); canonical `file_search` keeps its existing four-permit lane and per-store broad gate.
 - Add resource-keyed correctness limits where the connection lane no longer provides them: per-window mutation ownership, per-store read/search admission, per-repository Git admission. Connection FIFO remains a client-ordering policy only.
 - Classification is a static, reviewed table covering every canonical tool, enforced by an exhaustive test (no tool may default into a concurrent lane); capacities are chosen from Phase 0 baseline data, resolving the open question below.
+
+**Gate B capacity evidence (2026-06-11):** the WI-3 baseline recorded ordinary capacity 1, `file_search` capacity 4 per connection, and search capacity 4 per store, while live latency remained deferred because no app was launched. WI-10 therefore uses the conservative lower bounds: exclusive tools remain 1, small reads use 2 per connection and 2 per window/store, Git reads use 2 per connection plus 1 active request per repository, and canonical `file_search` remains unchanged at 4 per connection and 4 per store. These values are fixed by the WI-10 classification tests so later tuning requires an explicit evidence-backed change.
 
 **Done when:** the exhaustive tool-to-lane test exists; same-connection mixed bursts show reads/Git overlapping while mutations stay exclusive; PR #155's admission/freshness tests pass unchanged; WI-2 matrices show end-to-end latency improving rather than queue relocation to MainActor/Git/store lanes.
 

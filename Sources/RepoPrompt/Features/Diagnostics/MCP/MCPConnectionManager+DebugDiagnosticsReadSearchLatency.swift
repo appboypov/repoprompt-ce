@@ -518,6 +518,8 @@ import RepoPromptShared
                 "is_idle": snapshot.isIdle,
                 "lanes": [
                     MCPConnectionCallLane.ordinary.rawValue: readSearchLimiterLanePayload(snapshot.ordinary),
+                    MCPConnectionCallLane.smallRead.rawValue: readSearchLimiterLanePayload(snapshot.smallRead),
+                    MCPConnectionCallLane.gitRead.rawValue: readSearchLimiterLanePayload(snapshot.gitRead),
                     MCPConnectionCallLane.fileSearch.rawValue: readSearchLimiterLanePayload(snapshot.fileSearch)
                 ]
             ]

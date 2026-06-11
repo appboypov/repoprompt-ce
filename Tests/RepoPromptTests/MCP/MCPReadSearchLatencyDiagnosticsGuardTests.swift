@@ -36,6 +36,8 @@
             XCTAssertTrue(sibling.contains("\"lanes\""))
             XCTAssertTrue(sibling.contains("\"lane_count\""))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.ordinary.rawValue"))
+            XCTAssertTrue(sibling.contains("MCPConnectionCallLane.smallRead.rawValue"))
+            XCTAssertTrue(sibling.contains("MCPConnectionCallLane.gitRead.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.fileSearch.rawValue"))
             XCTAssertTrue(sibling.contains("maximum_active_count"))
             XCTAssertTrue(sibling.contains("maximum_queued_count"))
@@ -470,21 +472,29 @@
             ] {
                 XCTAssertEqual((autoSelection[key] as? NSNumber)?.intValue, 0, key)
             }
+            let smallReadLaneLimit = ServerNetworkManager.smallReadCallLaneLimit
+            let gitReadLaneLimit = ServerNetworkManager.gitReadCallLaneLimit
             let fileSearchLaneLimit = ServerNetworkManager.fileSearchCallLaneLimit
+            let totalLaneLimit = 1 + smallReadLaneLimit + gitReadLaneLimit + fileSearchLaneLimit
             let limiter = try XCTUnwrap(runtime["limiter"] as? [String: Any])
             XCTAssertEqual(limiter["found"] as? Bool, true)
             XCTAssertEqual(limiter["connection_id"] as? String, connectionID.uuidString)
-            XCTAssertEqual((limiter["lane_count"] as? NSNumber)?.intValue, 2)
-            XCTAssertEqual((limiter["limit"] as? NSNumber)?.intValue, 1 + fileSearchLaneLimit)
-            XCTAssertEqual((limiter["permits"] as? NSNumber)?.intValue, 1 + fileSearchLaneLimit)
+            XCTAssertEqual((limiter["lane_count"] as? NSNumber)?.intValue, 4)
+            XCTAssertEqual((limiter["limit"] as? NSNumber)?.intValue, totalLaneLimit)
+            XCTAssertEqual((limiter["permits"] as? NSNumber)?.intValue, totalLaneLimit)
             XCTAssertEqual((limiter["active_permit_count"] as? NSNumber)?.intValue, 0)
             XCTAssertEqual((limiter["waiter_count"] as? NSNumber)?.intValue, 0)
             XCTAssertEqual((limiter["in_flight_count"] as? NSNumber)?.intValue, 0)
             XCTAssertEqual(limiter["is_closed"] as? Bool, false)
             XCTAssertEqual(limiter["is_idle"] as? Bool, true)
             let lanes = try XCTUnwrap(limiter["lanes"] as? [String: Any])
-            XCTAssertEqual(Set(lanes.keys), ["ordinary", "file_search"])
-            for (laneName, laneLimit) in [("ordinary", 1), ("file_search", fileSearchLaneLimit)] {
+            XCTAssertEqual(Set(lanes.keys), ["ordinary", "small_read", "git_read", "file_search"])
+            for (laneName, laneLimit) in [
+                ("ordinary", 1),
+                ("small_read", smallReadLaneLimit),
+                ("git_read", gitReadLaneLimit),
+                ("file_search", fileSearchLaneLimit)
+            ] {
                 let lane = try XCTUnwrap(lanes[laneName] as? [String: Any])
                 XCTAssertEqual((lane["limit"] as? NSNumber)?.intValue, laneLimit, laneName)
                 XCTAssertEqual((lane["permits"] as? NSNumber)?.intValue, laneLimit, laneName)

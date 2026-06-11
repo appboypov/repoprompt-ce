@@ -896,7 +896,7 @@ import XCTest
             }
         }
 
-        func testUncooperativeDeadlineForceDisconnectsAndQueuedCallNeverEntersProvider() async throws {
+        func testUncooperativeSmallReadDeadlineForceDisconnectsAndCallBeyondCapacityNeverEntersProvider() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let clock = ExecutionWatchdogManualClock()
@@ -923,7 +923,19 @@ import XCTest
                     try await clock.waitForSleeperCount(1)
                     try await operationGate.waitUntilEntered(count: 1)
 
-                    let queued = Task {
+                    let second = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: [
+                                "path": fixture.contextA.fileURL.path,
+                                "context_id": fixture.contextA.tabID.uuidString
+                            ]
+                        )
+                    }
+                    try await clock.waitForSleeperCount(2)
+                    try await operationGate.waitUntilEntered(count: 2)
+
+                    let queuedBeyondCapacity = Task {
                         try await endpoint.callTool(
                             name: MCPWindowToolName.readFile,
                             arguments: [
@@ -933,14 +945,17 @@ import XCTest
                         )
                     }
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
-                    try await clock.waitForSleeperCount(1)
+                    try await clock.waitForSleeperCount(2)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+                    try await clock.waitForSleeperCount(2)
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
 
                     await Self.assertSocketClosed(first)
-                    await Self.assertSocketClosed(queued)
+                    await Self.assertSocketClosed(second)
+                    await Self.assertSocketClosed(queuedBeyondCapacity)
                     let enteredCount = await operationGate.enteredCount()
                     let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
-                    XCTAssertEqual(enteredCount, 1)
+                    XCTAssertEqual(enteredCount, MCPToolAdmissionPolicy.smallReadPerWindowLimit)
                     XCTAssertTrue(isTerminal)
 
                     let events = recorder.snapshot().filter {
