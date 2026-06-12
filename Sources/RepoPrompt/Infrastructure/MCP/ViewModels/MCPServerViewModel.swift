@@ -936,6 +936,8 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var tabContextByConnectionID: [UUID: TabScopedContext] = [:]
     @MainActor
+    var readFileAutoSelectionHandoverLineageByConnectionID: [UUID: ReadFileAutoSelectionHandoverLineage] = [:]
+    @MainActor
     var nextReadFileAutoSelectionBindingGeneration: UInt64 = 0
     #if DEBUG
         @MainActor
@@ -3056,10 +3058,57 @@ final class MCPServerViewModel: ObservableObject {
             policy: .allowLegacyImplicitRouting
         ) else { return Task.isCancelled ? .cancelled : .completed }
         let key = readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
+        for predecessorKey in readFileAutoSelectionPredecessorContextKeys(
+            metadata: metadata,
+            successorKey: key
+        ) {
+            let predecessorResult = await readFileAutoSelectionCoordinator.drain(
+                requirement,
+                for: predecessorKey,
+                onCanonicalWaiterRegistered: readFileAutoSelectionPredecessorDrainWaiterRegisteredHandlerForTesting
+            )
+            guard predecessorResult == .completed else { return predecessorResult }
+        }
         return await readFileAutoSelectionCoordinator.drain(requirement, for: key)
     }
 
+    @MainActor
+    private func readFileAutoSelectionPredecessorContextKeys(
+        metadata: RequestMetadata,
+        successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+    ) -> [MCPReadFileAutoSelectionCoordinator.ContextKey] {
+        guard let connectionID = metadata.connectionID,
+              let lineage = readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
+              lineage.successorKey == successorKey,
+              case let .bound(successorConnectionID, successorRunID) = successorKey.route,
+              successorConnectionID == connectionID,
+              let successorRunID,
+              connectionIDByRunID[successorRunID] == connectionID,
+              connectionIDToRunID[connectionID] == successorRunID
+        else { return [] }
+        return lineage.predecessorKeys
+    }
+
+    @MainActor
+    private var readFileAutoSelectionPredecessorDrainWaiterRegisteredHandlerForTesting: (() -> Void)? {
+        #if DEBUG
+            readFileAutoSelectionPredecessorDrainWaiterRegisteredHandlerStorageForTesting
+        #else
+            nil
+        #endif
+    }
+
     #if DEBUG
+        @MainActor
+        var readFileAutoSelectionPredecessorDrainWaiterRegisteredHandlerStorageForTesting: (() -> Void)?
+
+        @MainActor
+        func setReadFileAutoSelectionPredecessorDrainWaiterRegisteredHandlerForTesting(
+            _ handler: (() -> Void)?
+        ) {
+            readFileAutoSelectionPredecessorDrainWaiterRegisteredHandlerStorageForTesting = handler
+        }
+
         @MainActor
         func setReadFileAutoSelectionCanonicalApplyGateForTesting(_ gate: (() async -> Void)?) {
             readFileAutoSelectionCoordinator.setCanonicalApplyGateForTesting(gate)

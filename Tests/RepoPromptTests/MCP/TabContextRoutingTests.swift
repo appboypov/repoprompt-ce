@@ -175,6 +175,284 @@ final class TabContextRoutingTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testPendingPolicyReadSelectionLineagePreservesRapidReplacementOrder() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let unrelatedRunID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let firstConnectionID = UUID()
+        let secondConnectionID = UUID()
+        let thirdConnectionID = UUID()
+        let unrelatedConnectionID = UUID()
+        let snapshot = ComposeTabState(id: tabID, name: "Agent")
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+        window.mcpServer.installTabContext(
+            clientID: unrelatedConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: unrelatedRunID,
+            signalRouting: false
+        )
+        let secondToken = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: secondConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+        let thirdToken = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: thirdConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+
+        XCTAssertEqual(secondToken.displacedConnectionID, firstConnectionID)
+        XCTAssertEqual(thirdToken.displacedConnectionID, secondConnectionID)
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: thirdConnectionID
+            ),
+            [firstConnectionID, secondConnectionID]
+        )
+        XCTAssertFalse(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: thirdConnectionID
+            ).contains(unrelatedConnectionID)
+        )
+    }
+
+    @MainActor
+    func testPendingPolicyReadSelectionLineageSurvivesSameConnectionTokenSupersession() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let firstConnectionID = UUID()
+        let secondConnectionID = UUID()
+        let snapshot = ComposeTabState(id: tabID, name: "Agent")
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: secondConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+
+        let supersedingToken = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+            connectionID: secondConnectionID,
+            runID: runID,
+            windowID: window.windowID
+        ))
+        XCTAssertNil(supersedingToken.displacedConnectionID)
+        XCTAssertEqual(supersedingToken.displacedConnectionRunID, runID)
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+
+        var staleGenerationContext = try XCTUnwrap(
+            window.mcpServer.tabContextByConnectionID[secondConnectionID]
+        )
+        staleGenerationContext.readFileAutoSelectionGeneration &+= 1
+        window.mcpServer.tabContextByConnectionID[secondConnectionID] = staleGenerationContext
+        _ = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+            connectionID: secondConnectionID,
+            runID: runID,
+            windowID: window.windowID
+        ))
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ).isEmpty
+        )
+    }
+
+    @MainActor
+    func testPendingPolicyReadSelectionLineageRejectsStaleDisplacedReverseOwner() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let otherRunID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let firstConnectionID = UUID()
+        let secondConnectionID = UUID()
+        let snapshot = ComposeTabState(id: tabID, name: "Agent")
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: secondConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+
+        window.mcpServer.connectionIDByRunID[runID] = firstConnectionID
+        window.mcpServer.connectionIDByRunID[otherRunID] = firstConnectionID
+        window.mcpServer.connectionIDToRunID[firstConnectionID] = otherRunID
+        let staleOwnerToken = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+            connectionID: secondConnectionID,
+            runID: runID,
+            windowID: window.windowID
+        ))
+
+        XCTAssertEqual(staleOwnerToken.displacedConnectionID, firstConnectionID)
+        XCTAssertEqual(staleOwnerToken.displacedConnectionRunID, otherRunID)
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ).isEmpty
+        )
+    }
+
+    @MainActor
+    func testPendingPolicyReadSelectionLineageRejectsCrossTabAndWorkspaceDisplacement() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let firstConnectionID = UUID()
+        let crossTabConnectionID = UUID()
+        let crossWorkspaceConnectionID = UUID()
+        let firstWorkspaceID = UUID()
+        let secondWorkspaceID = UUID()
+        let firstTabID = UUID()
+        let secondTabID = UUID()
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: firstWorkspaceID,
+            snapshot: ComposeTabState(id: firstTabID, name: "First"),
+            runID: runID,
+            signalRouting: false
+        )
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: crossTabConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: firstWorkspaceID,
+            snapshot: ComposeTabState(id: secondTabID, name: "Second"),
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: crossWorkspaceConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: secondWorkspaceID,
+            snapshot: ComposeTabState(id: secondTabID, name: "Second Workspace"),
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: crossTabConnectionID
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: crossWorkspaceConnectionID
+            ).isEmpty
+        )
+    }
+
     func testActiveTabCompatibilityDecisionAllowsOnlyLegacyNonRunScopedCallers() {
         XCTAssertEqual(
             MCPServerViewModel.activeTabCompatibilityFallbackDecision(

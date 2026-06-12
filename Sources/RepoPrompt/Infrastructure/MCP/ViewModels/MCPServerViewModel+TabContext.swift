@@ -24,6 +24,14 @@ extension MCPServerViewModel {
         let previousWindowID: Int?
     }
 
+    /// Ordered, immutable coordinator lanes displaced by one pending-policy replacement.
+    /// Keys retain connection and binding-generation identity so later replacement churn cannot
+    /// redirect a drain to another tab, workspace, run, or context generation.
+    struct ReadFileAutoSelectionHandoverLineage {
+        let successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+        let predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey]
+    }
+
     enum PendingPolicyRunIDMappingRollbackResult: Equatable {
         case restored
         case supersededBySameConnection
@@ -446,6 +454,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func releaseBinding(connectionID: UUID, preserveConnectionRunIDMapping: Bool = false) {
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         guard let context = tabContextByConnectionID.removeValue(forKey: connectionID) else { return }
         invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
@@ -704,6 +713,7 @@ extension MCPServerViewModel {
         }
 
         for connectionID in boundConnections {
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
             guard let context = tabContextByConnectionID.removeValue(forKey: connectionID) else { continue }
             invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
             endMirroringForConnection(connectionID)
@@ -1017,6 +1027,7 @@ extension MCPServerViewModel {
             }
 
             tabContextLog("installTabContext immediate bind connectionID=\(uuid)")
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: uuid)
             if let previous = tabContextByConnectionID[uuid] {
                 invalidateReadFileAutoSelection(connectionID: uuid, context: previous)
                 endMirroringForConnection(uuid)
@@ -1095,6 +1106,8 @@ extension MCPServerViewModel {
            let existing = tabContextByConnectionID[previousConnection]
         {
             if existing.windowID == windowID {
+                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: previousConnection)
+                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
                 tabContextByConnectionID.removeValue(forKey: previousConnection)
                 invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
                 endMirroringForConnection(previousConnection)
@@ -1130,6 +1143,7 @@ extension MCPServerViewModel {
             return nil
         }
 
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
         windowIDByConnection[connectionID] = context.windowID
@@ -1775,6 +1789,8 @@ extension MCPServerViewModel {
             }
         }
 
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: previousConnection)
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         tabContextByConnectionID.removeValue(forKey: previousConnection)
         invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
         endMirroringForConnection(previousConnection)
@@ -2079,6 +2095,7 @@ extension MCPServerViewModel {
         connectionID: UUID,
         signalRoutingFailure: Bool = true
     ) {
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         if connectionIDByRunID[runID] == connectionID {
             connectionIDByRunID.removeValue(forKey: runID)
             pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
@@ -2198,6 +2215,7 @@ extension MCPServerViewModel {
             previousPendingPolicyTokenID: previousRunID.flatMap { pendingPolicyRunIDMappingTokenIDByRunID[$0] },
             previousWindowID: windowIDByConnection[connectionID]
         )
+        installReadFileAutoSelectionHandoverLineage(for: token)
 
         if let displacedConnectionID = token.displacedConnectionID,
            connectionIDToRunID[displacedConnectionID] == runID
@@ -2216,6 +2234,62 @@ extension MCPServerViewModel {
         pendingPolicyRunIDMappingTokenIDByRunID[runID] = token.id
         tabContextLog("registerPendingPolicyRunIDMapping connectionID=\(connectionID) runID=\(runID) windowID=\(windowID)")
         return token
+    }
+
+    @MainActor
+    private func installReadFileAutoSelectionHandoverLineage(
+        for token: PendingPolicyRunIDMappingToken
+    ) {
+        guard let successorContext = tabContextByConnectionID[token.connectionID],
+              successorContext.runID == token.runID
+        else {
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+            return
+        }
+        let successorKey = readFileAutoSelectionContextKey(
+            connectionID: token.connectionID,
+            context: successorContext
+        )
+
+        guard let displacedConnectionID = token.displacedConnectionID else {
+            let preservesCurrentSuccessor = token.displacedConnectionRunID == token.runID
+                && connectionIDByRunID[token.runID] == token.connectionID
+                && connectionIDToRunID[token.connectionID] == token.runID
+                && readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID]?.successorKey == successorKey
+            if !preservesCurrentSuccessor {
+                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+            }
+            return
+        }
+
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+        guard token.displacedConnectionRunID == token.runID,
+              connectionIDByRunID[token.runID] == displacedConnectionID,
+              connectionIDToRunID[displacedConnectionID] == token.runID,
+              let displacedContext = tabContextByConnectionID[displacedConnectionID],
+              displacedContext.runID == token.runID,
+              successorContext.windowID == displacedContext.windowID,
+              successorContext.workspaceID == displacedContext.workspaceID,
+              successorContext.tabID == displacedContext.tabID
+        else { return }
+
+        let displacedKey = readFileAutoSelectionContextKey(
+            connectionID: displacedConnectionID,
+            context: displacedContext
+        )
+        var predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey] = []
+        if let inherited = readFileAutoSelectionHandoverLineageByConnectionID[displacedConnectionID],
+           inherited.successorKey == displacedKey
+        {
+            predecessorKeys.append(contentsOf: inherited.predecessorKeys)
+        }
+        if !predecessorKeys.contains(displacedKey) {
+            predecessorKeys.append(displacedKey)
+        }
+        readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID] = .init(
+            successorKey: successorKey,
+            predecessorKeys: predecessorKeys
+        )
     }
 
     @MainActor
@@ -2454,6 +2528,7 @@ extension MCPServerViewModel {
         // mutate state being committed. Successful Context Builder completion may retain
         // the connection/run routing maps until its independently-owned transport teardown joins.
         endMirroringForConnection(connectionID)
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         tabContextByConnectionID.removeValue(forKey: connectionID)
         if !deferRunMappingCleanupUntilCaller {
             windowIDByConnection.removeValue(forKey: connectionID)
@@ -2495,6 +2570,28 @@ extension MCPServerViewModel {
         return isStillCurrent() && !Task.isCancelled
     }
 
+    #if DEBUG
+        @MainActor
+        func readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+            connectionID: UUID
+        ) -> [UUID] {
+            guard let context = tabContextByConnectionID[connectionID],
+                  let runID = context.runID,
+                  connectionIDByRunID[runID] == connectionID,
+                  connectionIDToRunID[connectionID] == runID,
+                  let lineage = readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
+                  lineage.successorKey == readFileAutoSelectionContextKey(
+                      connectionID: connectionID,
+                      context: context
+                  )
+            else { return [] }
+            return lineage.predecessorKeys.compactMap { key in
+                guard case let .bound(predecessorConnectionID, _) = key.route else { return nil }
+                return predecessorConnectionID
+            }
+        }
+    #endif
+
     @MainActor
     func finishReadFileAutoSelectionForConnectionTeardown(connectionID: UUID) async {
         guard let context = tabContextByConnectionID[connectionID] else { return }
@@ -2511,6 +2608,7 @@ extension MCPServerViewModel {
         removeQueuedPendingContext: Bool = true
     ) {
         if let connectionID {
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
             if let context = tabContextByConnectionID[connectionID],
                runID == nil || context.runID == runID
             {
@@ -2553,6 +2651,9 @@ extension MCPServerViewModel {
 
         if let runID, connectionID == nil {
             // This is an explicit cleanup by runID (called when discovery ends)
+            for (boundConnectionID, context) in tabContextByConnectionID where context.runID == runID {
+                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: boundConnectionID)
+            }
             if let mappedConnection = connectionIDByRunID[runID] {
                 connectionIDToRunID.removeValue(forKey: mappedConnection)
                 windowIDByConnection.removeValue(forKey: mappedConnection)
