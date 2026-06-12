@@ -29,6 +29,10 @@ final class MCPGitToolAdmissionController {
         self.perRepositoryLimit = perRepositoryLimit
     }
 
+    func acquire(repositoryRoots: [URL]) async throws -> Lease {
+        try await acquire(repositoryKeys: repositoryRoots.map(Self.repositoryKey(for:)))
+    }
+
     func acquire(repositoryKeys rawKeys: [String]) async throws -> Lease {
         let repositoryKeys = Array(Set(rawKeys.map(Self.canonicalRepositoryKey))).sorted()
         precondition(!repositoryKeys.isEmpty)
@@ -82,6 +86,10 @@ final class MCPGitToolAdmissionController {
         admitWaitersInFIFOOrder()
     }
 
+    func activeCount(repositoryRoot: URL) -> Int {
+        activeByRepository[Self.repositoryKey(for: repositoryRoot)] ?? 0
+    }
+
     func activeCount(repositoryKey: String) -> Int {
         activeByRepository[Self.canonicalRepositoryKey(repositoryKey)] ?? 0
     }
@@ -90,8 +98,17 @@ final class MCPGitToolAdmissionController {
         waiters.count
     }
 
-    private static func canonicalRepositoryKey(_ key: String) -> String {
-        (key as NSString).standardizingPath.lowercased()
+    nonisolated static func repositoryKey(for checkoutRoot: URL) -> String {
+        let standardizedRoot = checkoutRoot.standardizedFileURL
+        let repositoryIdentity = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: standardizedRoot)?.commonDir
+            ?? standardizedRoot
+        return canonicalRepositoryKey(repositoryIdentity.path)
+    }
+
+    private nonisolated static func canonicalRepositoryKey(_ key: String) -> String {
+        URL(fileURLWithPath: key)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path.lowercased()
     }
 
     private func canAcquire(_ repositoryKeys: [String]) -> Bool {

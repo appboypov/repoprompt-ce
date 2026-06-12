@@ -287,6 +287,38 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertTrue(ledger.snapshots().isEmpty)
     }
 
+    func testGitAdmissionSerializesLinkedWorktreesByCommonDirectory() async throws {
+        let fixture = try GitAdmissionWorktreeFixture()
+        defer { fixture.cleanup() }
+        let controller = MCPGitToolAdmissionController(perRepositoryLimit: 1)
+        let gate = AdmissionTestGate()
+
+        XCTAssertEqual(
+            MCPGitToolAdmissionController.repositoryKey(for: fixture.repo),
+            MCPGitToolAdmissionController.repositoryKey(for: fixture.worktree)
+        )
+
+        let mainCheckout = gitTask(controller: controller, repositoryRoots: [fixture.repo], gate: gate)
+        let didStartMainCheckout = await waitUntil { await gate.startedCount() == 1 }
+        XCTAssertTrue(didStartMainCheckout)
+
+        let linkedWorktree = gitTask(controller: controller, repositoryRoots: [fixture.worktree], gate: gate)
+        try await Task.sleep(for: .milliseconds(50))
+        let startedWhileMainCheckoutHeld = await gate.startedCount()
+        XCTAssertEqual(startedWhileMainCheckoutHeld, 1)
+        XCTAssertEqual(controller.activeCount(repositoryRoot: fixture.repo), 1)
+        XCTAssertEqual(controller.activeCount(repositoryRoot: fixture.worktree), 1)
+        XCTAssertEqual(controller.waiterCount(), 1)
+
+        await gate.release()
+        try await mainCheckout.value
+        try await linkedWorktree.value
+        let finalGitCount = await gate.startedCount()
+        XCTAssertEqual(finalGitCount, 2)
+        XCTAssertEqual(controller.activeCount(repositoryRoot: fixture.repo), 0)
+        XCTAssertEqual(controller.activeCount(repositoryRoot: fixture.worktree), 0)
+    }
+
     func testGitAdmissionSerializesSameRepositoryAndOverlapsDistinctRepositories() async throws {
         let controller = MCPGitToolAdmissionController(perRepositoryLimit: 1)
         let gate = AdmissionTestGate()
@@ -344,6 +376,18 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
 
     private func gitTask(
         controller: MCPGitToolAdmissionController,
+        repositoryRoots: [URL],
+        gate: AdmissionTestGate
+    ) -> Task<Void, Error> {
+        Task {
+            let lease = try await controller.acquire(repositoryRoots: repositoryRoots)
+            await gate.enterAndWaitForRelease()
+            controller.release(lease)
+        }
+    }
+
+    private func gitTask(
+        controller: MCPGitToolAdmissionController,
         repositories: [String],
         gate: AdmissionTestGate
     ) -> Task<Void, Error> {
@@ -391,5 +435,52 @@ private actor AdmissionTestGate {
 private extension Array {
     var single: Element? {
         count == 1 ? first : nil
+    }
+}
+
+private struct GitAdmissionWorktreeFixture {
+    let sandbox: URL
+    let repo: URL
+    let worktree: URL
+
+    init() throws {
+        sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MCPGitToolAdmissionControllerTests-\(UUID().uuidString)", isDirectory: true)
+        repo = sandbox.appendingPathComponent("repo", isDirectory: true).standardizedFileURL
+        worktree = sandbox.appendingPathComponent("linked", isDirectory: true).standardizedFileURL
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        try runGit(["init"], cwd: repo)
+        try runGit(["config", "user.name", "RepoPrompt Test"], cwd: repo)
+        try runGit(["config", "user.email", "repoprompt@example.test"], cwd: repo)
+        try runGit(["config", "commit.gpgSign", "false"], cwd: repo)
+        try runGit(["checkout", "-b", "main"], cwd: repo)
+        try "base\n".write(to: repo.appendingPathComponent("Tracked.txt"), atomically: true, encoding: .utf8)
+        try runGit(["add", "Tracked.txt"], cwd: repo)
+        try runGit(["commit", "-m", "Initial commit"], cwd: repo)
+        try runGit(["worktree", "add", "-b", "feature/linked", worktree.path, "HEAD"], cwd: repo)
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: sandbox)
+    }
+
+    private func runGit(_ arguments: [String], cwd: URL) throws {
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: cwd,
+            environment: environment
+        )
+        guard result.terminationStatus == 0 else {
+            throw NSError(
+                domain: "MCPGitToolAdmissionControllerTests.git",
+                code: Int(result.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: result.outputText]
+            )
+        }
     }
 }
