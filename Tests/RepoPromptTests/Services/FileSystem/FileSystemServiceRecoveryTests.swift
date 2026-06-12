@@ -164,6 +164,130 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             withExtendedLifetime(cancellable) {}
         }
 
+        func testParallelScanFailureRestoresStateBeforeSerialFallback() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemParallelScanRollback")
+            let folders = ["A", "B", "C"]
+            var visitedPaths = Set<String>()
+            var visitedItems: [String: Bool] = [:]
+            for folder in folders {
+                let folderURL = root.appendingPathComponent(folder, isDirectory: true)
+                try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+                try "old".write(
+                    to: folderURL.appendingPathComponent("old.txt"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+                try "new".write(
+                    to: folderURL.appendingPathComponent("new.txt"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+                visitedPaths.formUnion([folder, "\(folder)/old.txt"])
+                visitedItems[folder] = true
+                visitedItems["\(folder)/old.txt"] = false
+            }
+
+            let service = try await FileSystemService(
+                path: root.path,
+                respectGitignore: false,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                testVisitedPaths: visitedPaths,
+                testVisitedItems: visitedItems,
+                isTestMode: false,
+                maxParallelScansOverride: 2
+            )
+            await service.setParallelFolderEnumerationHookForTesting { folder in
+                guard folder == "B" else { return }
+                for _ in 0 ..< 200 {
+                    let state = await service.getTestState()
+                    if state.visitedPaths.contains("A/new.txt") {
+                        throw NSError(
+                            domain: "FileSystemServiceRecoveryTests",
+                            code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "Injected parallel scan failure for \(folder)"]
+                        )
+                    }
+                    try await Task.sleep(nanoseconds: 5_000_000)
+                }
+                throw NSError(
+                    domain: "FileSystemServiceRecoveryTests",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for prior scan mutation"]
+                )
+            }
+
+            do {
+                _ = try await service.scanFoldersInParallel(folders)
+                XCTFail("Expected injected parallel scan failure")
+            } catch {
+                let restored = await service.getTestState()
+                XCTAssertEqual(restored.visitedPaths, visitedPaths)
+                XCTAssertEqual(restored.visitedItems, visitedItems)
+            }
+
+            await service.setParallelFolderEnumerationHookForTesting(nil)
+            var fallbackDeltas: [FileSystemDelta] = []
+            for folder in folders {
+                let deltas = try await service.scanOneLevelAndDiff(relativeFolderPath: folder)
+                fallbackDeltas.append(contentsOf: deltas)
+            }
+
+            XCTAssertTrue(fallbackDeltas.contains(.fileAdded("A/new.txt")))
+            XCTAssertTrue(fallbackDeltas.contains(.fileAdded("B/new.txt")))
+            XCTAssertTrue(fallbackDeltas.contains(.fileAdded("C/new.txt")))
+        }
+
+        func testRecoveryFullResyncPreservesExplicitlyManagedIgnoredFile() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryManagedIgnored")
+            try "*.ignored\n".write(
+                to: root.appendingPathComponent(".gitignore"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try "visible".write(
+                to: root.appendingPathComponent("visible.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try "hidden".write(
+                to: root.appendingPathComponent("secret.ignored"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let service = try await FileSystemService(
+                path: root.path,
+                respectGitignore: true,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: true,
+                testVisitedPaths: ["visible.txt"],
+                testVisitedItems: ["visible.txt": false],
+                isTestMode: false
+            )
+            let eligibility = await service.registerExplicitlyManagedRegularFile(relativePath: "secret.ignored")
+            guard case .ineligible(.ignored) = eligibility else {
+                return XCTFail("Expected ignored regular file to be explicitly manageable")
+            }
+
+            let deltas = try await service.reconcileEntireTreeAfterRecoveryFailure()
+            let state = await service.getTestState()
+
+            XCTAssertTrue(state.visitedPaths.contains("secret.ignored"))
+            XCTAssertEqual(state.visitedItems["secret.ignored"], false)
+            XCTAssertFalse(deltas.contains(.fileRemoved("secret.ignored")))
+            XCTAssertTrue(deltas.contains { delta in
+                if case .fileModified("secret.ignored", _) = delta {
+                    return true
+                }
+                return false
+            })
+        }
+
         func testCarryOverFolderScansPreserveIntermediateWatermarkUnderContinuousChurn() async throws {
             let root = try temporaryRoots.makeRoot(suiteName: "FileSystemFolderScanFairness")
             let folders = ["A", "B", "C"]

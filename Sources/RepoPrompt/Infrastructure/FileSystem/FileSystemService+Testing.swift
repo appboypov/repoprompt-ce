@@ -201,6 +201,12 @@ import Foundation
             contentReadChunkHandler = handler
         }
 
+        func setParallelFolderEnumerationHookForTesting(
+            _ handler: (@Sendable (String) async throws -> Void)?
+        ) {
+            parallelFolderEnumerationHookForTesting = handler
+        }
+
         func cachedEncodingForTesting(relativePath: String) -> String.Encoding? {
             encodingMap[relativePath]
         }

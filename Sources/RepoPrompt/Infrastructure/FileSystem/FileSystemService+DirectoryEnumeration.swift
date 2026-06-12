@@ -150,11 +150,19 @@ extension FileSystemService {
                         let rulesForFolder = perFolderIgnoreCache[folderRel]?.snapshot() ?? fallbackRules
                         let skipLinks = self.skipSymlinks
                         let preservedChildren = preservedChildrenByFolder[folderRel] ?? Set<String>()
+                        #if DEBUG
+                            let enumerationHook = parallelFolderEnumerationHookForTesting
+                        #endif
 
                         inFlight += 1
                         group.addTask(priority: .utility) {
                             // This runs outside the actor for true parallelism
-                            try Self.enumerateOneLevel(
+                            #if DEBUG
+                                if let enumerationHook {
+                                    try await enumerationHook(folderRel)
+                                }
+                            #endif
+                            return try Self.enumerateOneLevel(
                                 absFolder: absFolder,
                                 relFolder: folderRel,
                                 skipSymlinks: skipLinks,
@@ -392,10 +400,17 @@ extension FileSystemService {
             baseRelativePath: ""
         )
         let previousItems = visitedItems
+        var reconciledItems = actualItems
+        for (relativePath, wasDirectory) in previousItems where !wasDirectory && actualItems[relativePath] == nil {
+            let eligibility = await catalogRegularFileEligibility(relativePath: relativePath)
+            if case .ineligible(.ignored) = eligibility {
+                reconciledItems[relativePath] = false
+            }
+        }
         let previousPaths = Set(previousItems.keys)
-        let actualPaths = Set(actualItems.keys)
+        let actualPaths = Set(reconciledItems.keys)
         let typeChangedPaths = Set(previousPaths.intersection(actualPaths).filter {
-            previousItems[$0] != actualItems[$0]
+            previousItems[$0] != reconciledItems[$0]
         })
 
         let removedPaths = previousPaths.subtracting(actualPaths).union(typeChangedPaths)
@@ -405,14 +420,14 @@ extension FileSystemService {
                 return lhsDepth == rhsDepth ? lhs > rhs : lhsDepth > rhsDepth
             }
         let addedPaths = actualPaths.subtracting(previousPaths).union(typeChangedPaths)
-        let addedFolders = addedPaths.filter { actualItems[$0] == true }.sorted { lhs, rhs in
+        let addedFolders = addedPaths.filter { reconciledItems[$0] == true }.sorted { lhs, rhs in
             let lhsDepth = lhs.split(separator: "/").count
             let rhsDepth = rhs.split(separator: "/").count
             return lhsDepth == rhsDepth ? lhs < rhs : lhsDepth < rhsDepth
         }
-        let addedFiles = addedPaths.filter { actualItems[$0] == false }.sorted()
+        let addedFiles = addedPaths.filter { reconciledItems[$0] == false }.sorted()
         let retainedFiles = actualPaths.intersection(previousPaths).subtracting(typeChangedPaths)
-            .filter { actualItems[$0] == false }
+            .filter { reconciledItems[$0] == false }
             .sorted()
 
         var deltas: [FileSystemDelta] = []
@@ -428,7 +443,7 @@ extension FileSystemService {
         }
 
         visitedPaths = actualPaths
-        visitedItems = actualItems
+        visitedItems = reconciledItems
         pathCompsCache.removeAll()
         return deltas
     }

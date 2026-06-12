@@ -130,6 +130,9 @@ actor FileSystemService {
         /// Test-only hook invoked inside the real-filesystem off-actor content worker before each read.
         var contentReadChunkHandler: (@Sendable (String) async -> Void)?
 
+        /// Test-only hook invoked inside each real-filesystem parallel folder enumeration worker.
+        var parallelFolderEnumerationHookForTesting: (@Sendable (String) async throws -> Void)?
+
         /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
         var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
 
