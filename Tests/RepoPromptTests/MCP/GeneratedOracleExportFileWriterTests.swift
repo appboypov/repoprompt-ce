@@ -73,6 +73,7 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
                     logicalRoot: logicalRef,
                     physicalRoot: physicalRef,
                     binding: AgentSessionWorktreeBinding(
+                        id: "binding-id",
                         repositoryID: "repo-id",
                         repoKey: "repo-key",
                         logicalRootPath: logicalRoot.path,
