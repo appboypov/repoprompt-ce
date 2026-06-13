@@ -159,7 +159,7 @@ struct GitContextBranchSwitchCapsule: View {
             .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
             .background(Capsule().fill(Color.secondary.opacity(0.10)))
             .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75))
-            .fixedSize(horizontal: false, vertical: true)
+            .fixedSize(horizontal: true, vertical: true)
         }
         .buttonStyle(.plain)
         .disabled(isSwitching)
