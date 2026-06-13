@@ -327,7 +327,6 @@ final class WorkspaceSelectionCoordinator {
                 updateMCPSelectionPresentation(
                     selection,
                     for: identity,
-                    mirrorToUI: mirrorToUI,
                     workspaceManager: workspaceManager
                 )
             }
@@ -369,7 +368,6 @@ final class WorkspaceSelectionCoordinator {
             updateMCPSelectionPresentation(
                 selection,
                 for: identity,
-                mirrorToUI: mirrorToUI,
                 workspaceManager: workspaceManager
             )
         }
@@ -642,17 +640,15 @@ final class WorkspaceSelectionCoordinator {
     private func updateMCPSelectionPresentation(
         _ selection: StoredSelection,
         for identity: WorkspaceSelectionIdentity,
-        mirrorToUI: Bool,
         workspaceManager: any WorkspaceSelectionHost
     ) {
-        if mirrorToUI {
-            deferredUISelectionFenceByIdentity.removeValue(forKey: identity)
-        } else {
-            deferredUISelectionFenceByIdentity[identity] = DeferredUISelectionFence(
-                selection: selection,
-                liveUISelectionRevision: workspaceManager.liveUISelectionRevision
-            )
-        }
+        // Fence already-enqueued UI snapshots before either the active mirror or a deferred
+        // worktree presentation can run. A genuinely newer UI mutation advances the live
+        // revision and is still allowed to replace canonical selection.
+        deferredUISelectionFenceByIdentity[identity] = DeferredUISelectionFence(
+            selection: selection,
+            liveUISelectionRevision: workspaceManager.liveUISelectionRevision
+        )
         workspaceManager.updateComposeTabSelectionPresentation(selection, for: identity)
     }
 

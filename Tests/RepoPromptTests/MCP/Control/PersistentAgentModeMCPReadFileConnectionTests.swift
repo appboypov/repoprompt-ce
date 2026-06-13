@@ -15,6 +15,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #endif
     }
 
+    func testAgentOwnedExplicitSetPersistsForIndependentCanonicalLookup() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .agentOwnedExplicitSetIndependentLookup)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testPairAgentOwnedNoRangeReadSelectsNonEmptyWorktreeLogicalFile() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true, inactiveAgentTab: true) { fixture in
@@ -130,6 +140,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case workspaceReorderDuringPersistence
             case rebindDuringPersistence
             case agentOwnedCanonicalSelection
+            case agentOwnedExplicitSetIndependentLookup
             case agentOwnedNoRangeNonEmptyWorktreeFile
 
             var requiresSerialReadPrelude: Bool {
@@ -257,7 +268,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             let baseline = await fixture.retainedConnectionSnapshot()
             Self.assertStableAgentModeSnapshot(baseline, fixture: fixture)
-            if scenario == .agentOwnedNoRangeNonEmptyWorktreeFile {
+            if scenario == .agentOwnedNoRangeNonEmptyWorktreeFile
+                || scenario == .agentOwnedExplicitSetIndependentLookup
+            {
                 try await fixture.installPeerWindowLookupSnapshot()
             }
 
@@ -307,9 +320,65 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertRebindDuringAutoSelectionPersistence(fixture: fixture)
             case .agentOwnedCanonicalSelection:
                 try await assertAgentOwnedCanonicalSelection(fixture: fixture)
+            case .agentOwnedExplicitSetIndependentLookup:
+                try await assertAgentOwnedExplicitSetIndependentLookup(fixture: fixture)
             case .agentOwnedNoRangeNonEmptyWorktreeFile:
                 try await assertAgentOwnedNoRangeNonEmptyWorktreeFile(fixture: fixture)
             }
+        }
+
+        func assertAgentOwnedExplicitSetIndependentLookup(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 6)
+            let explicitSet = try await fixture.socketClient.request(
+                id: 7,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "set",
+                        "paths": [Fixture.liveRelativePath],
+                        "mode": "full",
+                        "view": "files",
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(explicitSet, id: 7)
+            XCTAssertTrue(explicitSet.contains(fixture.liveFileURL.lastPathComponent), explicitSet)
+            assertCanonicalSelection(
+                fixture: fixture,
+                selectedPaths: [fixture.liveFileURL.path],
+                slices: [:]
+            )
+            XCTAssertEqual(
+                fixture.peerCanonicalSelection()?.selectedPaths,
+                [fixture.liveFileURL.path]
+            )
+
+            let independent = try await fixture.makeIndependentPeerConnection()
+            do {
+                let independentGet = try await independent.socketClient.request(
+                    id: 4,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPWindowToolName.manageSelection,
+                        "arguments": [
+                            "op": "get",
+                            "view": "files",
+                            "path_display": "full",
+                            "_rawJSON": true
+                        ]
+                    ]
+                )
+                let selectionText = try Self.readFileText(from: independentGet, id: 4)
+                XCTAssertTrue(selectionText.contains(fixture.liveFileURL.path), selectionText)
+                XCTAssertTrue(selectionText.contains("\"full_count\":1"), selectionText)
+                XCTAssertGreaterThan(try Self.totalTokens(fromSelectionText: selectionText), 0)
+            } catch {
+                await independent.cleanup()
+                throw error
+            }
+            await independent.cleanup()
         }
 
         func assertAgentOwnedNoRangeNonEmptyWorktreeFile(fixture: Fixture) async throws {
