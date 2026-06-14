@@ -305,7 +305,9 @@ final class AgentModeViewModel: ObservableObject {
                 isRestoringState = false
                 return
             }
-            UserDefaults.standard.set(selectedAgent.rawValue, forKey: Self.lastUsedAgentKey)
+            if usesProductionAgentDefaultsAndModelPolling {
+                UserDefaults.standard.set(selectedAgent.rawValue, forKey: Self.lastUsedAgentKey)
+            }
             if let session = activeSession {
                 let previousAgent = session.selectedAgent
                 if previousAgent != selectedAgent {
@@ -544,6 +546,7 @@ final class AgentModeViewModel: ObservableObject {
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
     private let shouldManageCodexTooling: Bool
+    private let usesProductionAgentDefaultsAndModelPolling: Bool
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
@@ -905,6 +908,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func persistLastUsedModelIfNeeded(agent: AgentProviderKind, modelRaw: String) {
+        guard usesProductionAgentDefaultsAndModelPolling else { return }
         guard shouldPersistLastUsedModel(agent: agent, modelRaw: modelRaw) else { return }
         Self.persistModelForAgent(agentRaw: agent.rawValue, modelRaw: modelRaw)
     }
@@ -1085,6 +1089,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func updateDynamicModelPolling(startCursorPolling: Bool = true) {
+        guard usesProductionAgentDefaultsAndModelPolling else { return }
         codexCoordinator.updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
@@ -1370,6 +1375,7 @@ final class AgentModeViewModel: ObservableObject {
             mcpServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
         }
         shouldManageCodexTooling = true
+        usesProductionAgentDefaultsAndModelPolling = true
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
@@ -1434,9 +1440,7 @@ final class AgentModeViewModel: ObservableObject {
         setupObservers()
         updateDynamicModelPolling(startCursorPolling: false)
         syncAllActiveUIState()
-        Task { [weak self] in
-            await self?.refreshSkillCatalog(force: true)
-        }
+        scheduleInitialSkillCatalogRefresh()
     }
 
     #if DEBUG
@@ -1506,7 +1510,8 @@ final class AgentModeViewModel: ObservableObject {
             testCodexStallWatchdogProbeThreshold: TimeInterval? = nil,
             testCodexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
-            testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil
+            testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
+            testUsesProductionAgentDefaultsAndModelPolling: Bool = false
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -1544,6 +1549,7 @@ final class AgentModeViewModel: ObservableObject {
                     testMCPServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
                 }
             self.shouldManageCodexTooling = shouldManageCodexTooling
+            usesProductionAgentDefaultsAndModelPolling = testUsesProductionAgentDefaultsAndModelPolling
             let legacyWatchdogThreshold = testCodexStallWatchdogInactivityThreshold
             let testWatchdogProbeThreshold = testCodexStallWatchdogProbeThreshold ?? legacyWatchdogThreshold ?? 0
             let testWatchdogRecoveryThreshold: TimeInterval = if let explicitRecoveryThreshold = testCodexStallWatchdogRecoveryThreshold {
@@ -1610,12 +1616,12 @@ final class AgentModeViewModel: ObservableObject {
                 return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
             }
             refreshAvailableAgents()
-            restoreLastUsedAgentSelectionIfNeeded()
-            updateDynamicModelPolling(startCursorPolling: false)
-            syncAllActiveUIState()
-            Task { [weak self] in
-                await self?.refreshSkillCatalog(force: true)
+            if usesProductionAgentDefaultsAndModelPolling {
+                restoreLastUsedAgentSelectionIfNeeded()
+                updateDynamicModelPolling(startCursorPolling: false)
             }
+            syncAllActiveUIState()
+            scheduleInitialSkillCatalogRefresh()
         }
     #endif
 
@@ -1776,6 +1782,15 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         await skillCatalog.refreshIfNeeded(workspacePaths: paths, agentKind: agent)
+    }
+
+    private func scheduleInitialSkillCatalogRefresh() {
+        let catalog = skillCatalog
+        let paths = currentWorkspacePaths()
+        let agent = activeSession?.selectedAgent ?? selectedAgent
+        Task {
+            await catalog.refresh(workspacePaths: paths, agentKind: agent)
+        }
     }
 
     private func scheduleSkillCatalogRefresh(agentKind: AgentProviderKind? = nil) {
@@ -2968,14 +2983,14 @@ final class AgentModeViewModel: ObservableObject {
         let tabID = session.tabID
         let scope = applyEditsScope(for: tabID)
         let initialAutoEditEnabled = session.autoEditEnabled
+        let approvalStore = applyEditsApprovalStore
         session.applyEditsApprovalSubscriptionTask = Task { [weak self] in
-            guard let self else { return }
-            await applyEditsApprovalStore.setAutoEditEnabled(
+            await approvalStore.setAutoEditEnabled(
                 initialAutoEditEnabled,
                 for: scope,
                 updateGlobalDefault: false
             )
-            let (subscriptionID, stream) = await applyEditsApprovalStore.subscribe(scope: scope)
+            let (subscriptionID, stream) = await approvalStore.subscribe(scope: scope)
             await MainActor.run { [weak self] in
                 guard let self, let liveSession = sessions[tabID] else { return }
                 liveSession.applyEditsApprovalSubscriptionID = subscriptionID

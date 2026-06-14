@@ -349,6 +349,7 @@ public class APISettingsViewModel: ObservableObject {
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
     private var openRouterModelsTask: Task<Void, Never>?
+    private var initialLoadTask: Task<Void, Never>?
     private var cliConnectionCancellables = Set<AnyCancellable>()
     private var hasLoadedStoredData = false
     private var isLoadingStoredData = false
@@ -954,22 +955,68 @@ public class APISettingsViewModel: ObservableObject {
 
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
+    private let codexModelPollingService: CodexModelPollingService
+    private let storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)?
+    private let contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)?
+    private var hasPreparedForWindowClose = false
 
-    init(aiQueriesService: AIQueriesService, keyManager: KeyManager, loadStoredDataOnInit: Bool = true) {
+    init(
+        aiQueriesService: AIQueriesService,
+        keyManager: KeyManager,
+        loadStoredDataOnInit: Bool = true,
+        codexModelPollingService: CodexModelPollingService = .shared,
+        storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
+        contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
+    ) {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
+        self.codexModelPollingService = codexModelPollingService
+        self.storedDataLoadBoundary = storedDataLoadBoundary
+        self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         installCLIConnectionObservers()
         installAgentAvailabilityObservers()
         refreshAgentAvailability()
         if loadStoredDataOnInit {
-            Task {
-                await self.loadStoredDataIfNeeded()
-                await self.validateCachedContextBuilderProvidersIfNeeded()
+            initialLoadTask = Task { [weak self] in
+                guard let self else { return }
+                await loadStoredDataIfNeeded()
+                guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                await validateCachedContextBuilderProvidersIfNeeded()
             }
         }
     }
 
+    func prepareForWindowClose() {
+        guard !hasPreparedForWindowClose else { return }
+        hasPreparedForWindowClose = true
+        initialLoadTask?.cancel()
+        initialLoadTask = nil
+        openAIModelsTask?.cancel()
+        openAIModelsTask = nil
+        deepSeekModelsTask?.cancel()
+        deepSeekModelsTask = nil
+        fireworksModelsTask?.cancel()
+        fireworksModelsTask = nil
+        grokModelsTask?.cancel()
+        grokModelsTask = nil
+        groqModelsTask?.cancel()
+        groqModelsTask = nil
+        stopCodexModelsSubscription()
+        openCodeModelsTask?.cancel()
+        openCodeModelsTask = nil
+        cursorModelsTask?.cancel()
+        cursorModelsTask = nil
+        openRouterModelsTask?.cancel()
+        openRouterModelsTask = nil
+        contextBuilderProviderValidationTask?.cancel()
+        contextBuilderProviderValidationTask = nil
+        cliConnectionCancellables.removeAll()
+        agentAvailabilityCancellable?.cancel()
+        agentAvailabilityCancellable = nil
+    }
+
     deinit {
+        initialLoadTask?.cancel()
         openAIModelsTask?.cancel()
         deepSeekModelsTask?.cancel()
         fireworksModelsTask?.cancel()
@@ -1033,6 +1080,10 @@ public class APISettingsViewModel: ObservableObject {
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
         await loadAllKeys(accessMode: accessMode) // returns immediately; fetch tasks run in background
+        guard !Task.isCancelled, !hasPreparedForWindowClose else {
+            isLoadingStoredData = false
+            return
+        }
         hasLoadedStoredData = true
         isLoadingStoredData = false
     }
@@ -1044,6 +1095,10 @@ public class APISettingsViewModel: ObservableObject {
         _ completion: @escaping () -> Void
     ) async {
         await loadAllKeys(accessMode: accessMode)
+        guard !Task.isCancelled, !hasPreparedForWindowClose else {
+            isLoadingStoredData = false
+            return
+        }
         hasLoadedStoredData = true
         isLoadingStoredData = false
         completion() // fires while background fetches still run
@@ -1053,7 +1108,11 @@ public class APISettingsViewModel: ObservableObject {
     func loadStoredDataIfNeeded(
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
-        guard !hasLoadedStoredData, !isLoadingStoredData else { return }
+        guard !Task.isCancelled,
+              !hasPreparedForWindowClose,
+              !hasLoadedStoredData,
+              !isLoadingStoredData
+        else { return }
         isLoadingStoredData = true
         await loadStoredData(accessMode: accessMode)
     }
@@ -1063,6 +1122,7 @@ public class APISettingsViewModel: ObservableObject {
     /// cannot reject a saved dynamic model before discovery has had a chance to run.
     @MainActor
     func validateCachedContextBuilderProvidersIfNeeded() async {
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isContextBuilderProviderValidationComplete { return }
         if let contextBuilderProviderValidationTask {
             await contextBuilderProviderValidationTask.value
@@ -1072,11 +1132,14 @@ public class APISettingsViewModel: ObservableObject {
         // Load persisted ACP catalogs before any provider result can trigger restoration.
         // A live refresh may legitimately omit dynamic metadata, especially for Cursor.
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isContextBuilderProviderValidationComplete { return }
         if let contextBuilderProviderValidationTask {
             await contextBuilderProviderValidationTask.value
             return
         }
+        await contextBuilderProviderValidationWillBegin?()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         let shouldValidateClaude = isClaudeCodeConnected
         let shouldValidateClaudeBinary = hasActiveClaudeCompatibleBackend
@@ -1085,7 +1148,7 @@ public class APISettingsViewModel: ObservableObject {
         let shouldValidateCursor = isCursorConnected
 
         let task = Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             async let claudeReady = probeCachedClaudeCodeConnection(
                 ifNeeded: shouldValidateClaude,
@@ -1095,6 +1158,7 @@ public class APISettingsViewModel: ObservableObject {
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
             let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady)
+            guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
             applyContextBuilderProviderValidationResult(readiness.1, provider: .codexExec)
@@ -1239,6 +1303,8 @@ public class APISettingsViewModel: ObservableObject {
     func loadAllKeys(
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+
         // ── 0. Cancel previous background fetches ───────────────────────────────
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
@@ -1261,6 +1327,8 @@ public class APISettingsViewModel: ObservableObject {
 
         keychainAccessDiagnostics.removeAll()
         loadNonSecretStoredData()
+        await storedDataLoadBoundary?()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ----------------------------------------------------------------
         // 1. Fetch tokens independently so one denied provider does not abort
@@ -1327,6 +1395,7 @@ public class APISettingsViewModel: ObservableObject {
             accessMode: accessMode,
             preserveExistingValueOnFailure: false
         )
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ----------------------------------------------------------------
         // 2. Restore Azure configuration if it was readable. Denied/noninteractive
@@ -1394,6 +1463,7 @@ public class APISettingsViewModel: ObservableObject {
         // ----------------------------------------------------------------
         // 4. Fire-and-forget model-catalogue fetches (always refresh)
         // ----------------------------------------------------------------
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isOpenAIKeyValid { openAIModelsTask = Task { await self.updateOpenAIModels() } }
         if isDeepSeekKeyValid { deepSeekModelsTask = Task { await self.updateDeepSeekModels() } }
         if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
@@ -1413,6 +1483,7 @@ public class APISettingsViewModel: ObservableObject {
         // 5. Build initial UI list from whatever caches we already have
         // ----------------------------------------------------------------
         await updateAvailableModels()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ----------------------------------------------------------------
         // 6. Load Claude Code-compatible backend state (GLM/Kimi/Custom)
@@ -3190,6 +3261,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func startOpenCodeModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose else { return }
         guard openCodeModelsTask == nil else { return }
         openCodeModelsTask = Task { [weak self, workspacePath] in
             let stream = await OpenCodeACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
@@ -3338,6 +3410,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func startCursorModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose else { return }
         guard cursorModelsTask == nil else { return }
         cursorModelsTask = Task { [weak self, workspacePath] in
             let stream = await CursorACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
@@ -3521,14 +3594,16 @@ public class APISettingsViewModel: ObservableObject {
     /// Starts a subscription to the centralized Codex model polling service.
     /// Replaces the previous ephemeral-client one-shot refresh.
     private func startCodexModelsSubscriptionIfNeeded() {
+        guard !hasPreparedForWindowClose else { return }
         guard codexModelsTask == nil else { return }
-        codexModelsTask = Task { [weak self] in
+        let codexModelPollingService = codexModelPollingService
+        codexModelsTask = Task { [weak self, codexModelPollingService] in
             guard let self else { return }
 
             // subscribe() starts the polling loop if idle and immediately yields the latest
             // snapshot (if available). The polling loop refreshes immediately on first tick,
             // so no explicit refreshNow() is needed here.
-            let stream = await CodexModelPollingService.shared.subscribe()
+            let stream = await codexModelPollingService.subscribe()
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
@@ -3543,6 +3618,36 @@ public class APISettingsViewModel: ObservableObject {
         codexModelsTask?.cancel()
         codexModelsTask = nil
     }
+
+    #if DEBUG
+        func test_startCodexModelsSubscriptionIfNeeded() {
+            startCodexModelsSubscriptionIfNeeded()
+        }
+
+        var test_hasCodexModelsSubscriptionTask: Bool {
+            codexModelsTask != nil
+        }
+
+        var test_hasPreparedForWindowClose: Bool {
+            hasPreparedForWindowClose
+        }
+
+        var test_hasFinishedInitialStoredDataLoad: Bool {
+            hasLoadedStoredData && !isLoadingStoredData
+        }
+
+        var test_initialLoadTask: Task<Void, Never>? {
+            initialLoadTask
+        }
+
+        var test_hasContextBuilderProviderValidationTask: Bool {
+            contextBuilderProviderValidationTask != nil
+        }
+
+        func test_stopCodexModelsSubscription() {
+            stopCodexModelsSubscription()
+        }
+    #endif
 
     private func updateGrokModels() async {
         guard isGrokKeyValid else { return }
